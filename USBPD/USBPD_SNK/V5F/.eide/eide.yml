@@ -1,0 +1,194 @@
+version: "4.1"
+name: USBPD_SNK_V5F
+type: RISC-V
+deviceName: null
+packDir: null
+srcDirs:
+  - User
+virtualFolder:
+  name: <virtual_root>
+  files: []
+  folders:
+    - name: Core
+      files:
+        - path: ../../../SRC/Core/core_riscv.h
+        - path: ../../../SRC/Core/core_riscv.c
+      folders: []
+    - name: Ld
+      files: []
+      folders: []
+    - name: Peripheral
+      files: []
+      folders:
+        - name: src
+          files:
+            - path: ../../../SRC/Peripheral/src/ch32h417_wwdg.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_usart.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_tim.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_swpmi.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_spi.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_serdes.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_sdmmc.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_sdio.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_sai.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_rtc.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_rng.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_rcc.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_qspi.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_pwr.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_opa.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_ltdc.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_lptim.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_iwdg.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_ipc.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_i3c.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_i2c.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_hsem.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_hsadc.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_gpio.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_gpha.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_fmc.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_flash.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_exti.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_eth.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_ecdc.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_dvp.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_dma.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_dfsdm.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_dbgmcu.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_dac.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_crc.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_can.c
+            - path: ../../../SRC/Peripheral/src/ch32h417_adc.c
+          folders: []
+        - name: inc
+          files:
+            - path: ../../../SRC/Peripheral/inc/ch32h417_wwdg.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_usbpd.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_usb.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_usart.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_tim.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_swpmi.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_spi.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_serdes.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_sdmmc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_sdio.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_sai.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_rtc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_rng.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_rcc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_qspi.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_pwr.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_pioc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_opa.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_ltdc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_lptim.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_iwdg.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_ipc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_i3c.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_i2c.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_hsem.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_hsadc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_gpio.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_gpha.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_fmc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_flash.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_exti.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_eth.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_ecdc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_dvp.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_dma.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_dfsdm.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_dbgmcu.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_dac.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_crc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_can.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417_adc.h
+            - path: ../../../SRC/Peripheral/inc/ch32h417.h
+          folders: []
+    - name: Startup
+      files:
+        - path: ../../../SRC/Startup/startup_ch32h417_v5f.S
+        - path: ../../../SRC/Startup/startup_ch32h417_v3f.S
+      folders: []
+    - name: Common
+      files:
+        - path: ../Common/PD_Process.h
+        - path: ../Common/PD_Process.c
+        - path: ../Common/hardware.h
+        - path: ../Common/hardware.c
+      folders:
+        - name: Debug
+          files:
+            - path: ../Common/Debug/debug.h
+            - path: ../Common/Debug/debug.c
+          folders: []
+dependenceList: []
+outDir: build
+miscInfo:
+  uid: 0f476b867e96311faa2a0a1fcfd3d717
+targets:
+  obj:
+    cppPreprocessAttrs:
+      defineList:
+        - Core_V5F
+      incList:
+        - ../Common/Debug
+        - ../../../SRC/Core
+        - User
+        - ../../../SRC/Peripheral/inc
+        - ../Common
+      libList: []
+    excludeList:
+      - <virtual_root>/Ld/V3F
+      - <virtual_root>/Startup/startup_ch32h417_v3f.S
+    settings: {}
+    toolchain: RISCV_GCC
+    toolchainConfigMap:
+      RISCV_GCC:
+        linkerScriptPath: Ld/V5F/Link_v5f.ld
+        options:
+          version: 2
+          afterBuildTasks: []
+          asm-compiler:
+            ASM_FLAGS: -Wl,-Bstatic
+          beforeBuildTasks: []
+          c/cpp-compiler:
+            CXX_FLAGS: ""
+            C_FLAGS: -Wl,-Bstatic
+            language-c: gnu99
+            language-cpp: c++11
+            one-elf-section-per-data: true
+            one-elf-section-per-function: true
+            optimization: level-size
+            signed-char: true
+            warnings: all-warnings
+          global:
+            abi: ilp32
+            arch: rv32imac
+            code-model: medlow
+            misc-control:
+              - -msave-restore
+              - -fmessage-length=0
+              - -fno-common
+              - -Wunused
+              - -Wuninitialized
+            output-debug-info: enable
+          linker:
+            $outputTaskExcludes:
+              - .bin
+            LD_FLAGS: -nostartfiles --specs=nano.specs --specs=nosys.specs
+            LIB_FLAGS: -lm
+            output-format: elf
+            remove-unused-input-sections: true
+    uploadConfigMap:
+      JLink:
+        baseAddr: ""
+        bin: ""
+        cpuInfo:
+          cpuName: "null"
+          vendor: "null"
+        otherCmds: ""
+        proType: 1
+        speed: 8000
+    uploader: JLink

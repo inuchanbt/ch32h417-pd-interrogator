@@ -1,0 +1,11 @@
+CompileFlags:
+  Add:
+    - -isystemc:\users\james\.eide\tools\gcc_riscv\riscv-none-embed\include\c++\8.3.0
+    - -isystemc:\users\james\.eide\tools\gcc_riscv\riscv-none-embed\include\c++\8.3.0\riscv-none-embed\rv32imac\ilp32
+    - -isystemc:\users\james\.eide\tools\gcc_riscv\riscv-none-embed\include\c++\8.3.0\backward
+    - -isystemc:\users\james\.eide\tools\gcc_riscv\lib\gcc\riscv-none-embed\8.3.0\include
+    - -isystemc:\users\james\.eide\tools\gcc_riscv\lib\gcc\riscv-none-embed\8.3.0\include-fixed
+    - -isystemc:\users\james\.eide\tools\gcc_riscv\riscv-none-embed\include
+  Remove: []
+  CompilationDatabase: ./build/obj
+  Compiler: C:\Users\James\.eide\tools\gcc_riscv\bin\riscv-none-embed-gcc.exe

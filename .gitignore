@@ -1,0 +1,20 @@
+# Build outputs
+**/obj/
+**/build/
+**/bin/
+**/out/
+
+# IDE caches and machine-local state
+**/.settings/
+**/.mrs/
+**/.eide/log/
+**/.eide.usr.ctx.json
+*.ept
+*.eide-template
+
+# Miscellaneous local files
+*.log
+*.tmp
+Thumbs.db
+.DS_Store
+
