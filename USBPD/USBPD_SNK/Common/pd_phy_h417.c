@@ -792,6 +792,7 @@ void PD_PHY_TickMs(uint8_t delta_ms)
 
     PD_Analyzer_Attach_Tick(delta_ms);
     PD_Analyzer_Srccap_Tick(delta_ms);
+    PD_Source_VDM_Probe_Tick(delta_ms);
 }
 
 static void PD_PHY_RunDeferredRx(void)

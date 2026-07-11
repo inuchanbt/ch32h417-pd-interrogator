@@ -852,6 +852,7 @@ static void PD_EPR_Exit_NoResponse(void)
 	PD_PHY.WaitMsgRx = 0;
 	printf("\r\nEPR Mode Exit: no response; assuming returned to SPR\r\n");
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+	PD_Source_VDM_Probe_Arm_Delayed(250);
 }
 
 static void PD_EPR_Exit_RX(void)
@@ -884,6 +885,7 @@ static void PD_EPR_Exit_RX(void)
 		}
 	}
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+	PD_Source_VDM_Probe_Arm_Delayed(250);
 }
 
 static void PD_EPR_Exit(void)
@@ -1139,6 +1141,7 @@ static void PD_EPR_Mode_NoResponse(void)
 	PD_PHY.WaitMsgRx = 0;
 	printf("\r\nEPR Mode Enter: no response (source timed out)\r\n");
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+	PD_Source_VDM_Probe_Arm_Delayed(250);
 }
 
 static void PD_EPR_Mode_TxFailed(void)
@@ -1147,6 +1150,7 @@ static void PD_EPR_Mode_TxFailed(void)
 	PD_PHY_Abort();
 	printf("\r\nEPR Mode Enter: TX failed (no GoodCRC)\r\n");
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+	PD_Source_VDM_Probe_Arm_Delayed(250);
 }
 
 static void PD_EPR_Mode_Enter_RX(void)
@@ -1184,6 +1188,7 @@ static void PD_EPR_Mode_Enter_RX(void)
 	}
 	VDM_Sniff_SOPP_Cable();
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+	PD_Source_VDM_Probe_Arm_Delayed(250);
 }
 
 /* ===================================================================
@@ -1461,6 +1466,7 @@ void PD_EPR_Enter_Probe_If_Capable(void)
 	if ( PD_Stored_SrcCap_EprCap == 0 ) {
 		printf("Sink_Cap/EPR: wait for EPR-capable Source_Capabilities (current EPRCap=0)\r\n");
 		PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+		PD_Source_VDM_Probe_Arm_Delayed(750);
 		return;
 	}
 	if ( s_epr_sinkcap_sent == 0 ) {
@@ -1490,6 +1496,7 @@ void PD_EPR_Enter_Probe_If_Capable(void)
 	if ( PD_EPR_Probe_Done ) {
 		/* この接続では既に EPR プローブ試行済み */
 		PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+		PD_Source_VDM_Probe_Arm_Delayed(250);
 		return;
 	}
 	/* EPR_Attempted_FP: 同一 PDO セットへの EPR を MCU リセットまで抑制する。
@@ -1500,8 +1507,10 @@ void PD_EPR_Enter_Probe_If_Capable(void)
 		printf("EPR: already attempted for this PDO set (FP:0x%08lX), skipping.\r\n",
 		       (unsigned long)PD_EPR_Attempted_FP);
 		PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+		PD_Source_VDM_Probe_Arm_Delayed(250);
 		return;
 	}
+	PD_Source_VDM_Probe_Cancel();
 	PD_EPR_Probe_Done    = 1;
 	PD_EPR_Attempted_FP  = PD_Current_SrcCap_Fingerprint;
 	printf("TX EPR_Mode Enter (source advertised EPRCap=1)\r\n");
@@ -1898,6 +1907,7 @@ void pDevice_Unattached(void)
 	s_epr_sinkcap_sent = 0;
 	PD_Probed_SrcCap_Fingerprint = 0;  /* 物理切断: 再接続時に再プローブを許可 */
 	VDM_Reset_Disc_State();
+	PD_Source_VDM_Probe_Reset();
 	PD_User_DevOut();
 }
 
@@ -2225,6 +2235,7 @@ void pProt_RX_SrcCap(void)
 
 			if ( !previous_epr_cap && PD_Stored_SrcCap_EprCap ) {
 				printf("RX Source_Capabilities upgraded to EPR-capable set; continue PPS/EPR path.\r\n");
+				PD_Source_VDM_Probe_Cancel();
 				PD_PPS_Probe_Done = 0;
 				PD_EPR_Probe_Done = 0;
 				/* Interim Cap had EPRCap=0 so SinkCap was deferred — allow it now. */

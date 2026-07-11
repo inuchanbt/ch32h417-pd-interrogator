@@ -54,6 +54,8 @@ static u32 s_pd_ms_tick            = 0;
 static u32 s_vbus_up_ms_tick       = 0;
 static u8  s_cable_sniff_scheduled = 0;
 static u8  s_vbus_seen_on          = 0;
+static u16 s_source_probe_delay_ms = 0;
+static u8  s_source_probe_done     = 0;
 
 /*
  * SOP' packets are passively sniffed from BMC_AUX/LastRxSop in the PHY.
@@ -71,7 +73,62 @@ static void VDM_Print_Cable_Identity_ACK(const char *via);
 static void VDM_Cable_Enable_Vconn(void);
 static void VDM_Cable_Disable_Vconn(void);
 static void VDM_Try_Passive_SOPP(void);
+static void VDM_Source_Probe_Finish(const char *reason);
 void pProt_TX_DISC_MODES_Next(void);
+
+static u32 VDM_Read_DO(u8 index)
+{
+	u8 word = (u8)(1u + (index << 1));
+	return (u32)PD_RX_BUF[word] | ((u32)PD_RX_BUF[word + 1u] << 16);
+}
+
+void PD_Source_VDM_Probe_Arm_Delayed(u16 ms)
+{
+	if ( s_source_probe_done ) return;
+	if ( ms == 0u ) ms = 1u;
+	if ( s_source_probe_delay_ms == 0u || ms < s_source_probe_delay_ms ) {
+		s_source_probe_delay_ms = ms;
+	}
+}
+
+void PD_Source_VDM_Probe_Cancel(void)
+{
+	s_source_probe_delay_ms = 0u;
+}
+
+void PD_Source_VDM_Probe_Reset(void)
+{
+	s_source_probe_delay_ms = 0u;
+	s_source_probe_done = 0u;
+}
+
+void PD_Source_VDM_Probe_Tick(u8 delta_ms)
+{
+	if ( s_source_probe_delay_ms == 0u || s_source_probe_done ) return;
+	if ( PD_DEVICE.ConnectStat == 0 ) {
+		s_source_probe_delay_ms = 0u;
+		return;
+	}
+	if ( s_source_probe_delay_ms > delta_ms ) {
+		s_source_probe_delay_ms = (u16)(s_source_probe_delay_ms - delta_ms);
+		return;
+	}
+	if ( VDM_State.Explicit_Contract_Established == 0 ||
+	     PD_PHY.WaitMsgTx || PD_PHY.WaitMsgRx || (USBPD->CONTROL & PD_TX_EN) ) {
+		s_source_probe_delay_ms = 1u;
+		return;
+	}
+
+	s_source_probe_delay_ms = 0u;
+	s_source_probe_done = 1u;
+	VDM_Reset_Disc_Probe_Only();
+	PD_PHY.TxSop = PD_PHY_TX_SOP;
+	PD_PHY_Set_RxSop(PD_PHY_RX_SOP);
+	PD_PHY_Set_ListenOnlySopp(0);
+	printf("TX SOP Discover Identity (post power interrogation)\r\n");
+	pProt_TX_DISC_IDENT();
+	PD_PHY_FlushTxNow();
+}
 
 static void PD_Cable_Sniff_Stop(void)
 {
@@ -181,13 +238,17 @@ static void VDM_Print_Discover_Identity_ACK(const char *role)
 	u8 bytes = 2 + rxHeader->NDO * 4;
 	u8 words = 1 + rxHeader->NDO * 2;
 	u8 *raw = (u8 *)PD_RX_BUF;
-	u32 vdm_header = ((u32)PD_RX_BUF[1] << 16) | PD_RX_BUF[2];
-	u32 id_header  = ((u32)PD_RX_BUF[4] << 16) | PD_RX_BUF[3];
-	u32 cert_stat  = ((u32)PD_RX_BUF[6] << 16) | PD_RX_BUF[5];
-	u32 product    = ((u32)PD_RX_BUF[8] << 16) | PD_RX_BUF[7];
+	u32 vdm_header = ( rxHeader->NDO >= 1 ) ? VDM_Read_DO(0) : 0u;
+	u32 id_header  = ( rxHeader->NDO >= 2 ) ? VDM_Read_DO(1) : 0u;
+	u32 cert_stat  = ( rxHeader->NDO >= 3 ) ? VDM_Read_DO(2) : 0u;
+	u32 product    = ( rxHeader->NDO >= 4 ) ? VDM_Read_DO(3) : 0u;
 	u16 vid = (u16)(id_header & 0xFFFF);
 	u16 pid = (u16)((product >> 16) & 0xFFFF);
 	u16 bcd = (u16)(product & 0xFFFF);
+	u8 product_type_ufp = (u8)((id_header >> 27) & 0x07u);
+	u8 product_type_dfp = (u8)((id_header >> 23) & 0x07u);
+	u8 connector_type   = (u8)((id_header >> 21) & 0x03u);
+	u8 modal_operation  = (u8)((id_header >> 26) & 0x01u);
 
 	if ( words > 12 ) words = 12;
 	if ( bytes > 44 ) bytes = 44;
@@ -202,13 +263,18 @@ static void VDM_Print_Discover_Identity_ACK(const char *role)
 	printf("\r\n");
 
 	if ( rxHeader->NDO >= 1 ) printf("VDM Header:0x%08lX\r\n", (unsigned long)vdm_header);
-	if ( rxHeader->NDO >= 2 ) printf("ID Header VDO:0x%08lX VID:0x%04X\r\n", (unsigned long)id_header, vid);
+	if ( rxHeader->NDO >= 2 ) {
+		printf("ID Header VDO:0x%08lX VID:0x%04X UFPType:%u DFPType:%u Connector:%u Modal:%u\r\n",
+		       (unsigned long)id_header, vid, (unsigned)product_type_ufp,
+		       (unsigned)product_type_dfp, (unsigned)connector_type,
+		       (unsigned)modal_operation);
+	}
 	if ( rxHeader->NDO >= 3 ) printf("Cert Stat/XID:0x%08lX\r\n", (unsigned long)cert_stat);
 	if ( rxHeader->NDO >= 4 ) {
 		printf("Product VDO:0x%08lX PID:0x%04X bcdDevice:0x%04X\r\n", (unsigned long)product, pid, bcd);
 	}
 	if ( rxHeader->NDO >= 5 ) {
-		u32 extra = ((u32)PD_RX_BUF[10] << 16) | PD_RX_BUF[9];
+		u32 extra = VDM_Read_DO(4);
 		printf("Extra VDO[4]:0x%08lX\r\n", (unsigned long)extra);
 	}
 	if ( (vid == 0) && (pid == 0) ) {
@@ -258,20 +324,22 @@ static void VDM_Print_Cable_Identity_ACK(const char *via)
 	u8  bytes = 2 + rxHeader->NDO * 4;
 	u8  words = 1 + rxHeader->NDO * 2;
 	u8 *raw   = (u8 *)PD_RX_BUF;
-	u32 id_header = ( rxHeader->NDO >= 2 ) ? (((u32)PD_RX_BUF[4] << 16) | PD_RX_BUF[3]) : 0u;
-	u32 cert_xid  = ( rxHeader->NDO >= 3 ) ? (((u32)PD_RX_BUF[6] << 16) | PD_RX_BUF[5]) : 0u;
-	u32 cable_vdo = ( rxHeader->NDO >= 4 ) ? (((u32)PD_RX_BUF[8] << 16) | PD_RX_BUF[7]) : 0u;
+	u32 vdm_header= ( rxHeader->NDO >= 1 ) ? VDM_Read_DO(0) : 0u;
+	u32 id_header = ( rxHeader->NDO >= 2 ) ? VDM_Read_DO(1) : 0u;
+	u32 cert_xid  = ( rxHeader->NDO >= 3 ) ? VDM_Read_DO(2) : 0u;
+	u32 product   = ( rxHeader->NDO >= 4 ) ? VDM_Read_DO(3) : 0u;
+	u32 cable_vdo = ( rxHeader->NDO >= 5 ) ? VDM_Read_DO(4) : 0u;
 	u16 vid           = (u16)(id_header & 0xFFFFu);
-	u8  product_type  = (u8)((id_header >> 23) & 0x07u);  /* ID Header VDO [25:23] */
+	u16 pid           = (u16)((product >> 16) & 0xFFFFu);
+	u16 bcd_device    = (u16)(product & 0xFFFFu);
+	u8  product_type  = (u8)((id_header >> 27) & 0x07u);  /* Cable Product Type [29:27] */
 	u8  connector_type= (u8)((id_header >> 21) & 0x03u);  /* ID Header VDO [22:21] */
-	u8  curr_cap      = (u8)((cable_vdo >> 8) & 0x03u);
-	u8  max_v         = (u8)((cable_vdo >> 18) & 0x03u);
-	u8  epr_cap       = (u8)((cable_vdo >> 20) & 0x01u);
-	u8  usb4          = (u8)((cable_vdo >> 21) & 0x01u);
-	u8  usb_speed     = (u8)((cable_vdo >> 29) & 0x07u);
-	u8  vconn_req     = (u8)((cable_vdo >> 7) & 0x01u);
-	u8  vconn_pwr     = (u8)((cable_vdo >> 5) & 0x03u);
-	u16 pid           = (u16)((cable_vdo >> 16) & 0xFFFFu);  /* Active Cable Product VDO */
+	u8  curr_cap      = (u8)((cable_vdo >> 5) & 0x03u);
+	u8  max_v         = (u8)((cable_vdo >> 9) & 0x03u);
+	u8  usb_speed     = (u8)(cable_vdo & 0x07u);
+	u8  vdo_version   = (u8)((cable_vdo >> 21) & 0x07u);
+	u8  cable_latency = (u8)((cable_vdo >> 13) & 0x0Fu);
+	u8  termination   = (u8)((cable_vdo >> 11) & 0x03u);
 
 	if ( words > 12 ) words = 12;
 	if ( bytes > 44 ) bytes = 44;
@@ -284,6 +352,9 @@ static void VDM_Print_Cable_Identity_ACK(const char *via)
 	printf("RAW8:");
 	for ( i = 0; i < bytes; i++ ) printf(" %02X", raw[i]);
 	printf("\r\n");
+	if ( rxHeader->NDO >= 1 ) {
+		printf("  VDM Header:0x%08lX\r\n", (unsigned long)vdm_header);
+	}
 
 	if ( rxHeader->NDO >= 2 ) {
 		printf("  Cable ID Header: VID=0x%04X ProductType=%s ConnectorType=%u raw:0x%08lX\r\n",
@@ -293,43 +364,42 @@ static void VDM_Print_Cable_Identity_ACK(const char *via)
 	if ( rxHeader->NDO >= 3 ) {
 		printf("  Cert Stat/XID:0x%08lX\r\n", (unsigned long)cert_xid);
 	}
+	if ( rxHeader->NDO >= 4 ) {
+		printf("  Product VDO:0x%08lX PID=0x%04X bcdDevice=0x%04X\r\n",
+		       (unsigned long)product, pid, bcd_device);
+	}
 
-	/* ProductType=0 でも Passive Cable VDO パターンならデコード (一部 e-marker) */
-	if ( ( product_type == 3u ||
-	       ( product_type == 0u && curr_cap >= 1u && curr_cap <= 2u ) ) &&
-	     rxHeader->NDO >= 4 ) {
-		printf("  Passive Cable VDO:0x%08lX\r\n", (unsigned long)cable_vdo);
+	if ( product_type == 3u && rxHeader->NDO >= 5 ) {
+		printf("  Passive Cable VDO1:0x%08lX\r\n", (unsigned long)cable_vdo);
 		printf("  Cable: type=Passive");
 		if ( curr_cap == 1u )      printf(" current=3A");
 		else if ( curr_cap == 2u ) printf(" current=5A");
 		else                       printf(" current=DefaultUSB");
 		printf(" maxV=%s", VDM_Cable_Max_Voltage_Name(max_v));
-		printf(" EPR=%u USB4=%u USB=%s\r\n",
-		       (unsigned)epr_cap, (unsigned)usb4, VDM_USB_Highest_Speed_Name(usb_speed));
+		printf(" VDOv=%u latency=%u termination=%u USB=%s\r\n",
+		       (unsigned)vdo_version, (unsigned)cable_latency,
+		       (unsigned)termination, VDM_USB_Highest_Speed_Name(usb_speed));
 	}
-	else if ( product_type == 4u && rxHeader->NDO >= 4 ) {
-		printf("  Active Cable VDO:0x%08lX\r\n", (unsigned long)cable_vdo);
+	else if ( product_type == 4u && rxHeader->NDO >= 5 ) {
+		printf("  Active Cable VDO1:0x%08lX\r\n", (unsigned long)cable_vdo);
 		printf("  Cable: type=Active");
 		if ( curr_cap == 1u )      printf(" current=3A");
 		else if ( curr_cap == 2u ) printf(" current=5A");
 		else                       printf(" current=DefaultUSB");
-		printf(" maxV=%s", VDM_Cable_Max_Voltage_Name(max_v));
-		printf(" EPR=%u USB4=%u USB=%s",
-		       (unsigned)epr_cap, (unsigned)usb4, VDM_USB_Highest_Speed_Name(usb_speed));
-		printf(" VCONN=%u VCONNpower=%u", (unsigned)vconn_req, (unsigned)vconn_pwr);
-		if ( rxHeader->NDO >= 5 ) {
-			u32 prod = ((u32)PD_RX_BUF[10] << 16) | PD_RX_BUF[9];
-			pid = (u16)((prod >> 16) & 0xFFFFu);
-			printf(" PID=0x%04X", pid);
-		}
-		printf("\r\n");
+		printf(" maxV=%s VDOv=%u latency=%u termination=%u USB=%s\r\n",
+		       VDM_Cable_Max_Voltage_Name(max_v), (unsigned)vdo_version,
+		       (unsigned)cable_latency, (unsigned)termination,
+		       VDM_USB_Highest_Speed_Name(usb_speed));
 	}
-	else if ( rxHeader->NDO >= 4 ) {
-		printf("  Cable/Product VDO:0x%08lX (ProductType=%s)\r\n",
+	else if ( rxHeader->NDO >= 5 ) {
+		printf("  Cable VDO1:0x%08lX (ProductType=%s)\r\n",
 		       (unsigned long)cable_vdo, VDM_Product_Type_Name(product_type));
 	}
 	else {
-		printf("  Cable Identity: incomplete response (need >=4 objects for cable VDO)\r\n");
+		printf("  Cable Identity: incomplete response (need >=5 objects for Cable VDO1)\r\n");
+	}
+	if ( rxHeader->NDO >= 6 ) {
+		printf("  Cable VDO2:0x%08lX\r\n", (unsigned long)VDM_Read_DO(5));
 	}
 
 	s_cable_identity_logged = 1;
@@ -482,8 +552,7 @@ static void VDM_Disc_SvidTimeout(void)
 {
 	PD_PHY.WaitMsgRx = 0;
 	printf("\r\nDiscover SVIDs: no response (source ignored request — normal for power-only DFPs)\r\n");
-	/* SVIDs 無応答後でも EPR 対応なら EPR Mode Entry を試みる */
-	PD_EPR_Enter_Probe_If_Capable();
+	VDM_Source_Probe_Finish("Discover SVIDs timeout");
 }
 
 /* ── Discover Modes タイムアウト ── */
@@ -531,7 +600,7 @@ void pProt_TX_DISC_MODES_Next(void)
 	u16 svid;
 	if ( VDM_Disc_Mode_Index >= VDM_Disc_SVID_Count ) {
 		printf("Discover Modes complete (all %d SVIDs)\r\n", VDM_Disc_SVID_Count);
-		PD_EPR_Enter_Probe_If_Capable();
+		VDM_Source_Probe_Finish("all SVID modes visited");
 		return;
 	}
 	svid = VDM_Disc_SVIDs[VDM_Disc_Mode_Index];
@@ -556,6 +625,14 @@ void VDM_Reset_Disc_State(void)
 {
 	VDM_Reset_Disc_Probe_Only();
 	VDM_Reset_Cable_State();
+}
+
+static void VDM_Source_Probe_Finish(const char *reason)
+{
+	PD_PHY.WaitMsgTx = 0;
+	PD_PHY.WaitMsgRx = 0;
+	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+	printf("SOP source discovery complete: %s\r\n", reason);
 }
 
 /* ── 固定の VDM 応答データ ── */
@@ -605,11 +682,8 @@ static void VDM_Try_Passive_SOPP(void)
 	if ( rxHeader->MsgType != PD_Data_VendorDefined ) return;
 	if ( s_cable_identity_logged ) return;
 	if ( rxHeader->NDO < 4 ) return;
-
-	if ( rxVDM->CommandType != 0x01 || rxVDM->Command != PD_VDM_DiscoverIdentity ) {
-		printf("\r\nRX SOP' VDM passive sniff (non-standard header decode) NDO:%d cmd=0x%02X type=0x%02X\r\n",
-		       rxHeader->NDO, (unsigned)rxVDM->Command, (unsigned)rxVDM->CommandType);
-	}
+	if ( rxVDM->CommandType != 0x01 ||
+	     rxVDM->Command != PD_VDM_DiscoverIdentity ) return;
 	VDM_Print_Cable_Identity_ACK("passive sniff");
 }
 
@@ -620,6 +694,26 @@ void pProt_RX_VDM(void)
 	if ( PD_PHY.LastRxSop != SOP_RX_SOP ) return;
 
 	if ( VDM_State.Explicit_Contract_Established == 0 ) return;
+	if ( rxHeader->Extended || rxHeader->MsgType != PD_Data_VendorDefined || rxHeader->NDO == 0 ) {
+		if ( !rxHeader->Extended && rxHeader->NDO == 0 &&
+		     rxHeader->MsgType == PD_Ctrl_SoftReset ) {
+			printf("SOP source discovery interrupted by Soft_Reset\r\n");
+			pProt_RX_SoftRst();
+		} else if ( !rxHeader->Extended && rxHeader->NDO == 0 &&
+		            ( rxHeader->MsgType == PD_Ctrl_Reject ||
+		              rxHeader->MsgType == PD_Ctrl_NotSupported ) ) {
+			VDM_Source_Probe_Finish("source rejected discovery");
+		} else {
+			VDM_Source_Probe_Finish("unexpected SOP response");
+		}
+		return;
+	}
+	if ( rxVDM->Command < PD_VDM_DiscoverIdentity ||
+	     rxVDM->Command > PD_VDM_Attention ) {
+		printf("RX malformed VDM command:0x%02X\r\n", (unsigned)rxVDM->Command);
+		VDM_Source_Probe_Finish("invalid VDM command");
+		return;
+	}
 
 	if ( rxVDM->CommandType == 0x00 ) {
 		if ( rxVDM->Command > PD_VDM_Attention ) PD_TX_NotSupported();
@@ -637,9 +731,20 @@ void pProt_RX_VDM(void)
 		}
 	}
 	else if ( rxVDM->CommandType == 0x01 ) {
-		(VDM_ACK_Msg_Handle[(rxVDM->Command)-1][(PD_PHY.Header.PortDataRole)?(0):(1)])();
+		void (*handler)(void) = VDM_ACK_Msg_Handle[(rxVDM->Command)-1]
+		                                          [(PD_PHY.Header.PortDataRole)?(0):(1)];
+		if ( handler ) handler();
+		else VDM_Source_Probe_Finish("unexpected VDM ACK");
 	}
-	/* NAK(0x02)/BUSY(0x03) は黙って無視。タイムアウトで次へ進む。 */
+	else if ( rxVDM->CommandType == 0x02 ) {
+		VDM_Source_Probe_Finish("source returned VDM NAK");
+	}
+	else if ( rxVDM->CommandType == 0x03 ) {
+		VDM_Source_Probe_Finish("source returned VDM BUSY");
+	}
+	else {
+		VDM_Source_Probe_Finish("invalid VDM command type");
+	}
 }
 
 /*--- UFP 側レスポンダ (我々が応答を返す) ---*/
@@ -746,7 +851,7 @@ static void pDiscIdent_TxFailed(void)
 	 */
 	PD_PHY.WaitMsgRx = 0;
 	printf("\r\nDiscover Identity TX failed (no GoodCRC): VDM/SOP may not be supported by this source.\r\n");
-	PD_EPR_Enter_Probe_If_Capable();
+	VDM_Source_Probe_Finish("Discover Identity TX failed");
 }
 
 static void pDiscIdent_NoResponse(void)
@@ -754,7 +859,7 @@ static void pDiscIdent_NoResponse(void)
 	/* GoodCRC は受け取ったが ACK が返ってこなかった（~30ms タイムアウト） */
 	PD_PHY.WaitMsgRx = 0;
 	printf("\r\nDiscover Identity: no response (source ignored request)\r\n");
-	PD_EPR_Enter_Probe_If_Capable();
+	VDM_Source_Probe_Finish("Discover Identity timeout");
 }
 
 void pProt_TX_DISC_IDENT(void)
@@ -834,7 +939,7 @@ void pProt_RX_ACK_SVID_DFP(void)
 
 	if ( VDM_Disc_SVID_Count == 0 ) {
 		printf("No SVIDs returned; Discover Modes skipped\r\n");
-		PD_EPR_Enter_Probe_If_Capable();
+		VDM_Source_Probe_Finish("source returned no SVIDs");
 		return;
 	}
 

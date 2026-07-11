@@ -33,6 +33,7 @@ The analyzer UART is configured for 921600 baud.
 - Optional PPS contract/status probe followed by restoration to fixed 5 V
 - EPR Mode entry and chunked EPR Source Capabilities reconstruction
 - Passive SOP' Discover Identity ACK decoding for E-marked cables
+- Post-interrogation SOP Discover Identity, SVID, and Mode discovery
 - Soft/Hard Reset recovery and Message ID tracking
 - Cable detach/re-attach support without resetting the CH32H417
 
@@ -41,8 +42,10 @@ Soft Reset, cable discovery failure, or another policy-engine decision. The
 firmware reports the capabilities actually advertised by the source and avoids
 forcing repeated EPR entry attempts.
 
+SOP' capture is deliberately passive and best-effort: the firmware never sends
+VCONN Swap or SOP' requests that could interfere with source-to-cable traffic.
+
 ## Hardware note
 
 This configuration expects external 5.1 kohm Rd resistors. Do not enable the
 internal Rd at the same time unless the board hardware is changed accordingly.
-
