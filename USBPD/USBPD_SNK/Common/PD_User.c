@@ -15,6 +15,7 @@
 #include "debug.h"
 #include "PD_User.H"
 #include "PD_VDM.h"
+#include "PD_Prot.h"
 
 //The device acts as a source, sending the Source_Capabilities message content
 u32 SrcCap[] = 	{0x3A21912C,};	//5V3A
@@ -150,4 +151,5 @@ void PD_User_DevOut(void)
 void PD_User_Timer(void)
 {
 	PD_Cable_Sniff_Timer_1ms();
+	PD_Result_Poll();
 }

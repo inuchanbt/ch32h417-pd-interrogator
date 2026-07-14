@@ -26,7 +26,7 @@ extern st_VDM VDM_State;
  *   収める必要があるため、ブロッキング遅延を完全に除去する。
  */
 #define PD_ANALYZER_REQUEST_DELAY_MS 0
-#define PD_ANALYZER_INFO_PROBES      0
+#define PD_ANALYZER_INFO_PROBES      1
 #define PD_ANALYZER_PPS_PROBE        1
 #define PD_ANALYZER_EPR_PRE_SINKCAP  1
 #define PD_ANALYZER_PPS_TARGET_MV    9000u
@@ -42,6 +42,7 @@ static u8  PD_InfoProbe_Step   = 0;
 static u8  PD_InfoProbe_Active = 0;
 static u8  PD_InfoProbe_Done   = 0;   /* GET_* probe completed or aborted by SoftReset */
 static u8  PD_InfoProbe_TxRetry = 0;
+static u8  PD_InfoProbe_NoResponseCnt = 0;
 static u8  PD_InfoProbe_SoftRst_Recovery_5V_Cnt = 0;
 /*
  * プローブ中に Source が SoftReset を返したステップをスキップするためのマスク。
@@ -71,9 +72,8 @@ static u32 PD_Failed_SrcCap_Fingerprint = 0;
 static u32 PD_Probed_SrcCap_Fingerprint = 0;
 static u8  PD_EPR_Probe_Done = 0;    /* 同一接続中に EPR プローブを 1 回のみ実行するフラグ */
 static u32 PD_EPR_Attempted_FP = 0;  /* EPR を試みた PDO セットのフィンガープリント
-                                       * pDevice_Attached/Unattached をまたいで保持し、
-                                       * SoftReset 再接続後の EPR 無限ループを防ぐ。
-                                       * MCU リセットで自動クリアされる。 */
+                                       * Soft/Hard Reset 中は保持して EPR 無限ループを防ぐ。
+                                       * 物理 CC 切断時にクリアして同じ電源の再測定を許可する。 */
 static u8 PD_Failed_SrcCap_NDO = 0;
 static u32 PD_Request_SrcCap_Fingerprint = 0;
 static u8 PD_Request_SrcCap_NDO = 0;
@@ -99,6 +99,404 @@ static u16 s_pps_req_mv      = 0;   /* リクエスト電圧 (mV)               
 
 /* EPR Enter 前の Sink_Capabilities 送信フラグ */
 static u8  s_epr_sinkcap_sent = 0;  /* 送信済み (pDevice_Unattached + InfoProbe_Start でリセット) */
+
+enum {
+	PD_RESULT_STATUS_UNKNOWN = 0,
+	PD_RESULT_STATUS_PENDING,
+	PD_RESULT_STATUS_PASS,
+	PD_RESULT_STATUS_FAIL,
+	PD_RESULT_STATUS_NA,
+	PD_RESULT_STATUS_UNSUPPORTED,
+	PD_RESULT_STATUS_NO_RESPONSE,
+	PD_RESULT_STATUS_TX_FAILED,
+	PD_RESULT_STATUS_NAK,
+	PD_RESULT_STATUS_BUSY,
+	PD_RESULT_STATUS_REJECTED,
+	PD_RESULT_STATUS_INVALID
+};
+
+enum {
+	PD_RESULT_EXIT_UNKNOWN = 0,
+	PD_RESULT_EXIT_ACK,
+	PD_RESULT_EXIT_SOFT_RESET,
+	PD_RESULT_EXIT_SOURCE_CAP,
+	PD_RESULT_EXIT_TIMEOUT,
+	PD_RESULT_EXIT_UNEXPECTED
+};
+
+#define PD_RESULT_DIRTY_ATTACH    0x0001u
+#define PD_RESULT_DIRTY_SPR       0x0002u
+#define PD_RESULT_DIRTY_EPR       0x0004u
+#define PD_RESULT_DIRTY_IDENTITY  0x0008u
+#define PD_RESULT_DIRTY_CABLE     0x0010u
+#define PD_RESULT_DIRTY_PROTOCOL  0x0020u
+
+typedef struct {
+	u16 session;
+	u8  active;
+	u8  cc;
+	u8  spr_pdo_count;
+	u8  pps_count;
+	u8  epr_capable;
+	u32 spr_max_mw;
+	u32 spr_pdo[7];
+	u8  epr_object_count;
+	u8  epr_complete;
+	u8  epr_fixed_count;
+	u16 epr_fixed_mv[4];
+	u16 epr_fixed_ma[4];
+	u16 avs_min_mv;
+	u16 avs_max_mv;
+	u8  avs_pdp_w;
+	u32 epr_pdo[11];
+	u8  identity_status;
+	u8  source_probe_status;
+	u16 source_vid;
+	u16 source_pid;
+	u32 source_id_header;
+	u32 source_product_vdo;
+	u8  cable_status;
+	u8  cable_type;
+	u8  cable_current_code;
+	u8  cable_max_voltage_code;
+	u8  cable_usb_speed;
+	u16 cable_vid;
+	u16 cable_pid;
+	u32 cable_id_header;
+	u32 cable_product_vdo;
+	u32 cable_vdo;
+	u8  spr_contract_status;
+	u8  pps_probe_status;
+	u8  epr_enter_status;
+	u8  chunk_status;
+	u8  epr_exit_status;
+	u8  info_probe_status[10];
+	u8  complete;
+} st_PD_Result;
+
+static st_PD_Result s_pd_result;
+static u16 s_pd_result_session_seq;
+static volatile u16 s_pd_result_dirty;
+
+static const char *PD_Result_Status_Name(u8 status)
+{
+	switch ( status ) {
+	case PD_RESULT_STATUS_PENDING:      return "pending";
+	case PD_RESULT_STATUS_PASS:         return "pass";
+	case PD_RESULT_STATUS_FAIL:         return "fail";
+	case PD_RESULT_STATUS_NA:           return "na";
+	case PD_RESULT_STATUS_UNSUPPORTED:  return "unsupported";
+	case PD_RESULT_STATUS_NO_RESPONSE:  return "no_response";
+	case PD_RESULT_STATUS_TX_FAILED:    return "tx_failed";
+	case PD_RESULT_STATUS_NAK:          return "nak";
+	case PD_RESULT_STATUS_BUSY:         return "busy";
+	case PD_RESULT_STATUS_REJECTED:     return "rejected";
+	case PD_RESULT_STATUS_INVALID:      return "invalid";
+	default:                            return "unknown";
+	}
+}
+
+static const char *PD_Result_Probe_Key(u8 step)
+{
+	switch ( step ) {
+	case 1: return "revision";
+	case 2: return "source_cap_ext";
+	case 3: return "status";
+	case 4: return "source_info";
+	case 5: return "pps_status";
+	case 6: return "country_codes";
+	case 7: return "manufacturer_info";
+	case 8: return "battery_cap";
+	case 9: return "battery_status";
+	default: return "unknown";
+	}
+}
+
+static void PD_Result_RecordProbeStatus(u8 step, u8 status)
+{
+	if ( step == 0u || step > 9u ) return;
+	s_pd_result.info_probe_status[step] = status;
+	if ( !s_pd_result.active ) return;
+	printf("@PD1,type=probe,session=%u,name=%s,status=%s\r\n",
+	       (unsigned)s_pd_result.session, PD_Result_Probe_Key(step),
+	       PD_Result_Status_Name(status));
+}
+
+static const char *PD_Result_Exit_Name(u8 status)
+{
+	switch ( status ) {
+	case PD_RESULT_EXIT_ACK:         return "ack";
+	case PD_RESULT_EXIT_SOFT_RESET:  return "soft_reset";
+	case PD_RESULT_EXIT_SOURCE_CAP:  return "source_cap";
+	case PD_RESULT_EXIT_TIMEOUT:     return "timeout";
+	case PD_RESULT_EXIT_UNEXPECTED:  return "unexpected";
+	default:                         return "unknown";
+	}
+}
+
+static u16 PD_Result_Cable_Current_mA(u8 code)
+{
+	if ( code == 1u ) return 3000u;
+	if ( code == 2u ) return 5000u;
+	return 0u;
+}
+
+static u16 PD_Result_Cable_Max_mV(u8 code)
+{
+	static const u16 voltage_mv[] = { 20000u, 30000u, 40000u, 48000u };
+	return voltage_mv[code & 0x03u];
+}
+
+static void PD_Result_Emit(u16 dirty, u8 final)
+{
+	u8 i;
+	if ( !s_pd_result.active && !final ) return;
+
+	if ( dirty & PD_RESULT_DIRTY_ATTACH ) {
+		printf("@PD1,type=attach,session=%u,cc=%u\r\n",
+		       (unsigned)s_pd_result.session, (unsigned)s_pd_result.cc);
+	}
+	if ( dirty & PD_RESULT_DIRTY_SPR ) {
+		printf("@PD1,type=spr,session=%u,pdo_count=%u,pps_count=%u,max_mw=%lu,epr_capable=%u\r\n",
+		       (unsigned)s_pd_result.session, (unsigned)s_pd_result.spr_pdo_count,
+		       (unsigned)s_pd_result.pps_count, (unsigned long)s_pd_result.spr_max_mw,
+		       (unsigned)s_pd_result.epr_capable);
+		for ( i = 0u; i < s_pd_result.spr_pdo_count && i < 7u; i++ ) {
+			printf("@PD1,type=spr_pdo,session=%u,index=%u,raw=%08lX\r\n",
+			       (unsigned)s_pd_result.session, (unsigned)(i + 1u),
+			       (unsigned long)s_pd_result.spr_pdo[i]);
+		}
+	}
+	if ( dirty & PD_RESULT_DIRTY_EPR ) {
+		printf("@PD1,type=epr,session=%u,object_count=%u,complete=%u,fixed_count=%u,avs_min_mv=%u,avs_max_mv=%u,pdp_w=%u\r\n",
+		       (unsigned)s_pd_result.session, (unsigned)s_pd_result.epr_object_count,
+		       (unsigned)s_pd_result.epr_complete, (unsigned)s_pd_result.epr_fixed_count,
+		       (unsigned)s_pd_result.avs_min_mv, (unsigned)s_pd_result.avs_max_mv,
+		       (unsigned)s_pd_result.avs_pdp_w);
+		for ( i = 0u; i < s_pd_result.epr_fixed_count && i < 4u; i++ ) {
+			printf("@PD1,type=epr_fixed,session=%u,index=%u,mv=%u,ma=%u\r\n",
+			       (unsigned)s_pd_result.session, (unsigned)i,
+			       (unsigned)s_pd_result.epr_fixed_mv[i],
+			       (unsigned)s_pd_result.epr_fixed_ma[i]);
+		}
+		for ( i = 0u; i < s_pd_result.epr_object_count && i < 11u; i++ ) {
+			printf("@PD1,type=epr_pdo,session=%u,index=%u,raw=%08lX\r\n",
+			       (unsigned)s_pd_result.session, (unsigned)(i + 1u),
+			       (unsigned long)s_pd_result.epr_pdo[i]);
+		}
+	}
+	if ( dirty & PD_RESULT_DIRTY_IDENTITY ) {
+		printf("@PD1,type=identity,session=%u,status=%s,probe=%s,vid=%04X,pid=%04X,id_header=%08lX,product_vdo=%08lX\r\n",
+		       (unsigned)s_pd_result.session,
+		       PD_Result_Status_Name(s_pd_result.identity_status),
+		       PD_Result_Status_Name(s_pd_result.source_probe_status),
+		       s_pd_result.source_vid, s_pd_result.source_pid,
+		       (unsigned long)s_pd_result.source_id_header,
+		       (unsigned long)s_pd_result.source_product_vdo);
+	}
+	if ( dirty & PD_RESULT_DIRTY_CABLE ) {
+		printf("@PD1,type=cable,session=%u,status=%s,cable_type=%u,current_ma=%u,max_mv=%u,usb_speed=%u,vid=%04X,pid=%04X,id_header=%08lX,product_vdo=%08lX,cable_vdo=%08lX\r\n",
+		       (unsigned)s_pd_result.session,
+		       PD_Result_Status_Name(s_pd_result.cable_status),
+		       (unsigned)s_pd_result.cable_type,
+		       (unsigned)PD_Result_Cable_Current_mA(s_pd_result.cable_current_code),
+		       (unsigned)PD_Result_Cable_Max_mV(s_pd_result.cable_max_voltage_code),
+		       (unsigned)s_pd_result.cable_usb_speed,
+		       s_pd_result.cable_vid, s_pd_result.cable_pid,
+		       (unsigned long)s_pd_result.cable_id_header,
+		       (unsigned long)s_pd_result.cable_product_vdo,
+		       (unsigned long)s_pd_result.cable_vdo);
+	}
+	if ( dirty & PD_RESULT_DIRTY_PROTOCOL ) {
+		printf("@PD1,type=result,session=%u,spr=%s,pps=%s,epr=%s,chunk=%s,exit=%s,source_probe=%s,complete=%u,final=%u\r\n",
+		       (unsigned)s_pd_result.session,
+		       PD_Result_Status_Name(s_pd_result.spr_contract_status),
+		       PD_Result_Status_Name(s_pd_result.pps_probe_status),
+		       PD_Result_Status_Name(s_pd_result.epr_enter_status),
+		       PD_Result_Status_Name(s_pd_result.chunk_status),
+		       PD_Result_Exit_Name(s_pd_result.epr_exit_status),
+		       PD_Result_Status_Name(s_pd_result.source_probe_status),
+		       (unsigned)s_pd_result.complete, (unsigned)final);
+	}
+	if ( final ) {
+		for ( i = 1u; i <= 9u; i++ ) {
+			if ( s_pd_result.info_probe_status[i] != PD_RESULT_STATUS_UNKNOWN ) {
+				printf("@PD1,type=probe,session=%u,name=%s,status=%s\r\n",
+				       (unsigned)s_pd_result.session, PD_Result_Probe_Key(i),
+				       PD_Result_Status_Name(s_pd_result.info_probe_status[i]));
+			}
+		}
+	}
+}
+
+void PD_Result_OnAttach(void)
+{
+	if ( s_pd_result.active ) return;
+	memset(&s_pd_result, 0, sizeof(s_pd_result));
+	s_pd_result_session_seq++;
+	if ( s_pd_result_session_seq == 0u ) s_pd_result_session_seq = 1u;
+	s_pd_result.session = s_pd_result_session_seq;
+	s_pd_result.active = 1u;
+	s_pd_result.pps_probe_status = PD_RESULT_STATUS_NA;
+	s_pd_result.epr_enter_status = PD_RESULT_STATUS_NA;
+	s_pd_result.chunk_status = PD_RESULT_STATUS_NA;
+	s_pd_result_dirty = PD_RESULT_DIRTY_ATTACH | PD_RESULT_DIRTY_PROTOCOL;
+}
+
+void PD_Result_SetCC(u8 cc)
+{
+	if ( !s_pd_result.active ) return;
+	s_pd_result.cc = cc;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_ATTACH;
+}
+
+void PD_Result_OnDetach(void)
+{
+	if ( !s_pd_result.active ) return;
+	PD_Result_Emit(PD_RESULT_DIRTY_ATTACH | PD_RESULT_DIRTY_SPR |
+	               PD_RESULT_DIRTY_EPR | PD_RESULT_DIRTY_IDENTITY |
+	               PD_RESULT_DIRTY_CABLE | PD_RESULT_DIRTY_PROTOCOL, 1u);
+	printf("@PD1,type=detach,session=%u\r\n", (unsigned)s_pd_result.session);
+	s_pd_result.active = 0u;
+	s_pd_result_dirty = 0u;
+}
+
+void PD_Result_Poll(void)
+{
+	u16 dirty;
+	if ( !s_pd_result.active || s_pd_result_dirty == 0u ) return;
+	if ( PD_PHY.WaitMsgTx || PD_PHY.WaitMsgRx || (USBPD->CONTROL & PD_TX_EN) ) return;
+	dirty = s_pd_result_dirty;
+	s_pd_result_dirty = 0u;
+	PD_Result_Emit(dirty, 0u);
+}
+
+static void PD_Result_UpdateSPR(const u32 *pdo, u8 count)
+{
+	u8 i;
+	u32 max_mw = 0u;
+	if ( count > 7u ) count = 7u;
+	s_pd_result.spr_pdo_count = count;
+	s_pd_result.pps_count = 0u;
+	s_pd_result.epr_capable = 0u;
+	memset(s_pd_result.spr_pdo, 0, sizeof(s_pd_result.spr_pdo));
+	for ( i = 0u; i < count; i++ ) {
+		u32 raw = pdo[i];
+		u8 type = (u8)(raw >> 30);
+		u32 mw = 0u;
+		s_pd_result.spr_pdo[i] = raw;
+		if ( type == 0u ) {
+			u32 mv = ((raw >> 10) & 0x3FFu) * 50u;
+			u32 ma = (raw & 0x3FFu) * 10u;
+			mw = mv * ma / 1000u;
+			if ( (raw >> 23) & 1u ) s_pd_result.epr_capable = 1u;
+		} else if ( type == 1u ) {
+			mw = (raw & 0x3FFu) * 250u;
+		} else if ( type == 2u ) {
+			u32 mv = ((raw >> 20) & 0x3FFu) * 50u;
+			u32 ma = (raw & 0x3FFu) * 10u;
+			mw = mv * ma / 1000u;
+		} else if ( ((raw >> 28) & 0x03u) == 0u ) {
+			u32 mv = ((raw >> 17) & 0xFFu) * 100u;
+			u32 ma = (raw & 0x7Fu) * 50u;
+			s_pd_result.pps_count++;
+			mw = mv * ma / 1000u;
+		}
+		if ( mw > max_mw ) max_mw = mw;
+	}
+	s_pd_result.spr_max_mw = max_mw;
+	if ( s_pd_result.pps_count ) {
+		if ( s_pd_result.pps_probe_status == PD_RESULT_STATUS_NA )
+			s_pd_result.pps_probe_status = PD_RESULT_STATUS_PENDING;
+	} else {
+		s_pd_result.pps_probe_status = PD_RESULT_STATUS_NA;
+	}
+	if ( s_pd_result.epr_capable ) {
+		if ( s_pd_result.epr_enter_status == PD_RESULT_STATUS_NA )
+			s_pd_result.epr_enter_status = PD_RESULT_STATUS_PENDING;
+	} else {
+		s_pd_result.epr_enter_status = PD_RESULT_STATUS_NA;
+		s_pd_result.chunk_status = PD_RESULT_STATUS_NA;
+	}
+	s_pd_result_dirty |= PD_RESULT_DIRTY_SPR | PD_RESULT_DIRTY_PROTOCOL;
+}
+
+static void PD_Result_UpdateEPR(const u32 *pdo, u8 count, u8 complete)
+{
+	u8 i;
+	if ( count > 11u ) count = 11u;
+	s_pd_result.epr_object_count = count;
+	s_pd_result.epr_complete = complete;
+	s_pd_result.epr_fixed_count = 0u;
+	s_pd_result.avs_min_mv = 0u;
+	s_pd_result.avs_max_mv = 0u;
+	s_pd_result.avs_pdp_w = 0u;
+	memset(s_pd_result.epr_pdo, 0, sizeof(s_pd_result.epr_pdo));
+	for ( i = 0u; i < count; i++ ) {
+		u32 raw = pdo[i];
+		s_pd_result.epr_pdo[i] = raw;
+		if ( i >= 7u && raw != 0u ) {
+			u8 type = (u8)(raw >> 30);
+			if ( type == 0u && s_pd_result.epr_fixed_count < 4u ) {
+				u8 n = s_pd_result.epr_fixed_count++;
+				s_pd_result.epr_fixed_mv[n] = (u16)(((raw >> 10) & 0x3FFu) * 50u);
+				s_pd_result.epr_fixed_ma[n] = (u16)((raw & 0x3FFu) * 10u);
+			} else if ( type == 3u && (((raw >> 28) & 0x03u) == 1u ||
+			                              ((raw >> 28) & 0x03u) == 2u) ) {
+				s_pd_result.avs_min_mv = (u16)(((raw >> 8) & 0x1FFu) * 100u);
+				s_pd_result.avs_max_mv = (u16)(((raw >> 17) & 0x1FFu) * 100u);
+				s_pd_result.avs_pdp_w = (u8)(raw & 0xFFu);
+			}
+		}
+	}
+	s_pd_result.epr_enter_status = complete ? PD_RESULT_STATUS_PASS : s_pd_result.epr_enter_status;
+	s_pd_result.chunk_status = complete ? PD_RESULT_STATUS_PASS : PD_RESULT_STATUS_FAIL;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_EPR | PD_RESULT_DIRTY_PROTOCOL;
+}
+
+void PD_Result_SetSourceIdentity(u16 vid, u16 pid, u32 id_header, u32 product_vdo)
+{
+	s_pd_result.identity_status = PD_RESULT_STATUS_PASS;
+	s_pd_result.source_vid = vid;
+	s_pd_result.source_pid = pid;
+	s_pd_result.source_id_header = id_header;
+	s_pd_result.source_product_vdo = product_vdo;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_IDENTITY;
+}
+
+void PD_Result_SetCableIdentity(u16 vid, u16 pid, u8 product_type,
+		u8 current_code, u8 max_voltage_code, u8 usb_speed,
+		u32 id_header, u32 product_vdo, u32 cable_vdo)
+{
+	s_pd_result.cable_status = PD_RESULT_STATUS_PASS;
+	s_pd_result.cable_vid = vid;
+	s_pd_result.cable_pid = pid;
+	s_pd_result.cable_type = product_type;
+	s_pd_result.cable_current_code = current_code;
+	s_pd_result.cable_max_voltage_code = max_voltage_code;
+	s_pd_result.cable_usb_speed = usb_speed;
+	s_pd_result.cable_id_header = id_header;
+	s_pd_result.cable_product_vdo = product_vdo;
+	s_pd_result.cable_vdo = cable_vdo;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_CABLE;
+}
+
+void PD_Result_SetSourceDiscovery(u8 result)
+{
+	switch ( result ) {
+	case PD_RESULT_DISC_DONE:         s_pd_result.source_probe_status = PD_RESULT_STATUS_PASS; break;
+	case PD_RESULT_DISC_NO_RESPONSE:  s_pd_result.source_probe_status = PD_RESULT_STATUS_NO_RESPONSE; break;
+	case PD_RESULT_DISC_TX_FAILED:    s_pd_result.source_probe_status = PD_RESULT_STATUS_TX_FAILED; break;
+	case PD_RESULT_DISC_NAK:          s_pd_result.source_probe_status = PD_RESULT_STATUS_NAK; break;
+	case PD_RESULT_DISC_BUSY:         s_pd_result.source_probe_status = PD_RESULT_STATUS_BUSY; break;
+	case PD_RESULT_DISC_REJECTED:     s_pd_result.source_probe_status = PD_RESULT_STATUS_REJECTED; break;
+	default:                          s_pd_result.source_probe_status = PD_RESULT_STATUS_INVALID; break;
+	}
+	if ( s_pd_result.identity_status == PD_RESULT_STATUS_UNKNOWN )
+		s_pd_result.identity_status = s_pd_result.source_probe_status;
+	s_pd_result.complete = 1u;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_IDENTITY | PD_RESULT_DIRTY_PROTOCOL;
+}
 
 static void PD_Print_Source_Capabilities_Deferred(void);
 
@@ -313,6 +711,8 @@ static void PD_Print_Source_Capabilities_Deferred(void)
 	u8 epr_capable = PD_Stored_SrcCap_EprCap;
 	u8 apdo_count = 0;
 
+	PD_Result_UpdateSPR(PD_PHY.rxSrcCap, PD_Stored_SrcCap_NDO);
+
 	printf("RX Source_Capabilities (SPR) NDO:%d SpecRev:%d MsgID:%d\r\n",
 		PD_Stored_SrcCap_NDO, PD_Stored_SrcCap_SpecRev, PD_Stored_SrcCap_MsgID);
 	for ( i = 0; i < PD_Stored_SrcCap_NDO; i++ ) {
@@ -423,6 +823,8 @@ static const char *PD_Ext_Msg_Name(u8 msg)
 	case PD_Ext_Status:             return "Status";
 	case PD_Ext_ManufacturerInfo:   return "Manufacturer_Info";
 	case PD_Ext_PPSStatus:          return "PPS_Status";
+	case PD_Ext_CountryInfo:        return "Country_Info";
+	case PD_Ext_CountryCodes:       return "Country_Codes";
 	case PD_Ext_SinkCapExtended:    return "Sink_Capabilities_Extended";
 	case PD_Ext_BattertCap:         return "Battery_Capabilities";
 	case PD_Ext_GetManufacturerInfo:return "Get_Manufacturer_Info";
@@ -563,6 +965,9 @@ static void PD_Decode_Status_Message(void)
 	printf("  Status decode: internalTempRaw=0x%02X presentInputRaw=0x%02X eventFlags=%02X %02X %02X %02X %02X\r\n",
 		p[0], p[1], p[2], p[3], p[4], p[5], p[6]);
 	printf("  Status note: field names are tentative; raw payload bytes above are authoritative.\r\n");
+	printf("@PD1,type=source_status,session=%u,size=%u,raw=%02X%02X%02X%02X%02X%02X%02X\r\n",
+	       (unsigned)s_pd_result.session, (unsigned)rxExtHeader->DataSize,
+	       p[0], p[1], p[2], p[3], p[4], p[5], p[6]);
 }
 
 static void PD_Decode_PPS_Status_Message(void)
@@ -572,6 +977,9 @@ static void PD_Decode_PPS_Status_Message(void)
 	u16 out_ma = (u16)(p[2] * 50);
 	printf("  PPS Status decode: output=%umV current=%umA flags=0x%02X\r\n", out_mv, out_ma, p[3]);
 	printf("  PPS Status note: valid mainly after PPS contract; under Fixed contract some supplies return placeholder/status bytes.\r\n");
+	printf("@PD1,type=pps_status,session=%u,output_mv=%u,current_ma=%u,flags=%02X\r\n",
+	       (unsigned)s_pd_result.session, (unsigned)out_mv, (unsigned)out_ma,
+	       (unsigned)p[3]);
 }
 
 /* Source_Info Data Object decode (PD 3.1 sec 6.5.1 Get_Source_Info response).
@@ -601,6 +1009,9 @@ static void PD_Decode_Source_Info(void)
 		printf(" Temp=%u\xB0""C", (unsigned)temp);
 	}
 	printf(" PresentInput=%s raw:0x%08lX\r\n", input_str[inp], (unsigned long)do0);
+	printf("@PD1,type=source_info,session=%u,pdp_w=%u,temp_raw=%u,present_input=%u,raw=%08lX\r\n",
+	       (unsigned)s_pd_result.session, (unsigned)pdp, (unsigned)temp,
+	       (unsigned)inp, (unsigned long)do0);
 }
 
 /*
@@ -628,6 +1039,10 @@ static void PD_Decode_Revision_Message(void)
 	u8 ver_min  = ver_bcd & 0xF;
 	printf("  Revision: USB PD Rev %u.%u  (USB Ver %u.%u)\r\n",
 		rev_maj, rev_min, ver_maj, ver_min);
+	printf("@PD1,type=revision,session=%u,pd_major=%u,pd_minor=%u,usb_major=%u,usb_minor=%u,raw=%08lX\r\n",
+	       (unsigned)s_pd_result.session, (unsigned)rev_maj, (unsigned)rev_min,
+	       (unsigned)ver_maj, (unsigned)ver_min,
+	       (unsigned long)(((u32)PD_RX_BUF[2] << 16) | PD_RX_BUF[1]));
 }
 
 static void PD_Decode_Source_Cap_Extended(void)
@@ -637,6 +1052,9 @@ static void PD_Decode_Source_Cap_Extended(void)
 	u16 pid = (u16)p[2] | ((u16)p[3] << 8);
 	u32 xid = (u32)p[4] | ((u32)p[5] << 8) | ((u32)p[6] << 16) | ((u32)p[7] << 24);
 	printf("  SourceCapExt guessed fields: VID=0x%04X PID=0x%04X XID=0x%08lX\r\n", vid, pid, (unsigned long)xid);
+	printf("@PD1,type=source_cap_ext,session=%u,vid=%04X,pid=%04X,xid=%08lX,size=%u\r\n",
+	       (unsigned)s_pd_result.session, vid, pid, (unsigned long)xid,
+	       (unsigned)rxExtHeader->DataSize);
 	if ( rxExtHeader->DataSize >= 21 ) {
 		printf("  SourceCapExt tail: byte20/PDP-or-power-field=0x%02X\r\n", p[20]);
 	}
@@ -648,6 +1066,9 @@ static void PD_Decode_Manufacturer_Info(void)
 	u8 size = rxExtHeader->DataSize;
 	u8 i;
 	u16 vid, pid;
+	char safe_name[33];
+	u8 safe_len = 0;
+	safe_name[0] = 0;
 	if ( size < 4 ) {
 		printf("  MfgInfo: too short (%d bytes)\r\n", size);
 		return;
@@ -669,6 +1090,14 @@ static void PD_Decode_Manufacturer_Info(void)
 			for ( i = 0; i < effective_len; i++ ) {
 				char c = (char)p[4 + i];
 				printf("%c", (c >= 0x20 && c < 0x7F) ? c : '?');
+				if ( safe_len < 32u ) {
+					if ( (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+					     (c >= 'a' && c <= 'z') || c == '-' || c == '.' ) {
+						safe_name[safe_len++] = c;
+					} else {
+						safe_name[safe_len++] = '_';
+					}
+				}
 			}
 			printf("\"");
 		}
@@ -676,7 +1105,11 @@ static void PD_Decode_Manufacturer_Info(void)
 			printf(" Name=(empty/spaces only)");
 		}
 	}
+	safe_name[safe_len] = 0;
 	printf("\r\n");
+	printf("@PD1,type=manufacturer,session=%u,vid=%04X,pid=%04X,name=%s\r\n",
+	       (unsigned)s_pd_result.session, vid, pid,
+	       safe_len ? safe_name : "unavailable");
 }
 
 static void PD_Decode_BatteryCap(void)
@@ -697,6 +1130,10 @@ static void PD_Decode_BatteryCap(void)
 			printf(" BattType=0x%02X", p[8]);
 		}
 		printf("\r\n");
+		printf("@PD1,type=battery_cap,session=%u,vid=%04X,pid=%04X,design_01wh=%u,last_full_01wh=%u,battery_type=%u\r\n",
+		       (unsigned)s_pd_result.session, vid, pid, (unsigned)design,
+		       (unsigned)(size >= 8 ? ((u16)p[6] | ((u16)p[7] << 8)) : 0u),
+		       (unsigned)(size >= 9 ? p[8] : 0u));
 	}
 }
 
@@ -709,6 +1146,19 @@ static void PD_Decode_BatteryStatusData(void)
 		(unsigned long)dw, flags, cap_raw);
 	printf("  BatteryStatus flags: InvalidBatRef=%d BattPresent=%d BattIsCharging=%d BattIsDischarg=%d\r\n",
 		(flags >> 0) & 1, (flags >> 1) & 1, (flags >> 2) & 1, (flags >> 3) & 1);
+	printf("@PD1,type=battery_status,session=%u,raw=%08lX,flags=%u,capacity_raw=%u\r\n",
+	       (unsigned)s_pd_result.session, (unsigned long)dw,
+	       (unsigned)flags, (unsigned)cap_raw);
+}
+
+static void PD_Decode_Country_Codes(void)
+{
+	u8 *p = ((u8 *)PD_RX_BUF) + 4;
+	u8 size = rxExtHeader->DataSize;
+	printf("@PD1,type=country_codes,session=%u,size=%u,first=%02X%02X%02X%02X\r\n",
+	       (unsigned)s_pd_result.session, (unsigned)size,
+	       size > 0u ? p[0] : 0u, size > 1u ? p[1] : 0u,
+	       size > 2u ? p[2] : 0u, size > 3u ? p[3] : 0u);
 }
 
 static void PD_InfoProbe_LogResponse(void)
@@ -735,6 +1185,10 @@ static void PD_InfoProbe_LogResponse(void)
 		}
 		else if ( rxHeader->MsgType == PD_Ext_BattertCap ) {
 			PD_Decode_BatteryCap();
+		}
+		else if ( rxHeader->MsgType == PD_Ext_CountryCodes ) {
+			PD_Print_ExtPayload_Indexed();
+			PD_Decode_Country_Codes();
 		}
 		else {
 			PD_Print_ExtPayload_Indexed();
@@ -809,6 +1263,7 @@ static void PD_InfoProbe_Start(void)
 	}
 	PD_InfoProbe_Active = 1;
 	PD_InfoProbe_TxRetry = 0;
+	PD_InfoProbe_NoResponseCnt = 0;
 	/*
 	 * Sink_Capabilities はプローブ前ではなく EPR_Mode Enter 直前に送信する。
 	 * プローブ前に送ると Anker/KFD 等が Soft_Reset を発してプローブが妨害される。
@@ -824,6 +1279,7 @@ static void PD_InfoProbe_Finish(void)
 	PD_InfoProbe_Active = 0;
 	PD_InfoProbe_Step = 0;
 	PD_InfoProbe_TxRetry = 0;
+	PD_InfoProbe_NoResponseCnt = 0;
 	PD_InfoProbe_Done = 1;
 	/*
 	 * プローブ試行済みフィンガープリントを記録。
@@ -850,6 +1306,8 @@ static void PD_EPR_Exit(void);  /* 前方宣言 */
 static void PD_EPR_Exit_NoResponse(void)
 {
 	PD_PHY.WaitMsgRx = 0;
+	s_pd_result.epr_exit_status = PD_RESULT_EXIT_TIMEOUT;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	printf("\r\nEPR Mode Exit: no response; assuming returned to SPR\r\n");
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 	PD_Source_VDM_Probe_Arm_Delayed(250);
@@ -866,24 +1324,30 @@ static void PD_EPR_Exit_RX(void)
 		if ( action == 0 ) action = (u8)((do0 >> 4) & 0x0F);
 
 		if ( action == 5 ) {  /* Exit Acknowledged — PD 3.1 Table 6-38 */
+			s_pd_result.epr_exit_status = PD_RESULT_EXIT_ACK;
 			printf("EPR Mode: Exit Acknowledged — back to SPR\r\n");
 		} else {
+			s_pd_result.epr_exit_status = PD_RESULT_EXIT_UNEXPECTED;
 			printf("EPR Mode Exit: action=0x%X\r\n", (unsigned)action);
 		}
 	} else {
 		if ( !rxHeader->Extended && rxHeader->NDO == 0 &&
 		     rxHeader->MsgType == PD_Ctrl_SoftReset ) {
+			s_pd_result.epr_exit_status = PD_RESULT_EXIT_SOFT_RESET;
 			printf("EPR Mode Exit: Source issued Soft_Reset; treating as returned to SPR\r\n");
 			/* SoftReset に正しく応答する — pProt_RX_SoftRst は後続の
 			 * pProt_IDLE 設定で上書きされるため、ここでは単純に SPR 復帰とみなす。 */
 		} else if ( !rxHeader->Extended && rxHeader->NDO != 0 &&
 		            rxHeader->MsgType == PD_Data_SrcCap ) {
+			s_pd_result.epr_exit_status = PD_RESULT_EXIT_SOURCE_CAP;
 			printf("EPR Mode Exit: Source sent Source_Capabilities; treating as returned to SPR\r\n");
 		} else {
+			s_pd_result.epr_exit_status = PD_RESULT_EXIT_UNEXPECTED;
 			printf("EPR Mode Exit: unexpected message 0x%02X (NDO=%d Extended=%d); treating as returned to SPR\r\n",
 			       rxHeader->MsgType, rxHeader->NDO, rxHeader->Extended);
 		}
 	}
+	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 	PD_Source_VDM_Probe_Arm_Delayed(250);
 }
@@ -912,6 +1376,18 @@ static u32 s_epr_pdo_buf[11];      /* Object 1-11 (index 0-10)                  
 static u16 s_epr_total_size;       /* EPR payload の総バイト数 (DataSize)           */
 static u8  s_epr_obj7_partial[2];  /* Object 7 先頭2バイト (chunk 0 bytes 24-25)   */
 static u8  s_epr_softreset_wait_cnt; /* SoftReset-while-waiting Cap; limit storms */
+static u8  s_epr_chunk_request_retry;
+
+static void PD_EPR_Reassembly_Reset(void)
+{
+	u8 i;
+	s_epr_total_size = 0u;
+	s_epr_softreset_wait_cnt = 0u;
+	s_epr_obj7_partial[0] = 0u;
+	s_epr_obj7_partial[1] = 0u;
+	s_epr_chunk_request_retry = 0u;
+	for ( i = 0u; i < 11u; i++ ) s_epr_pdo_buf[i] = 0u;
+}
 
 /* EPR_Source_Capabilities 再構成テーブルを一括表示 */
 static void PD_EPR_Print_Reconstructed(void)
@@ -935,13 +1411,31 @@ static void PD_EPR_Print_Reconstructed(void)
 	}
 }
 
+static void PD_EPR_SrcCap_RX(void);
+
 static void PD_EPR_SrcCap_Timeout(void)
 {
+	u8 partial_count;
 	PD_PHY.WaitMsgRx = 0;
+	if ( s_epr_total_size > 24u && s_epr_chunk_request_retry < 2u ) {
+		s_epr_chunk_request_retry++;
+		printf("\r\nEPR_Source_Capabilities: chunk 1 timeout; retry request %u/2\r\n",
+		       (unsigned)s_epr_chunk_request_retry);
+		PD_PHY.WaitMsgRx = 1;
+		PD_PHY.MsgRxCnt  = 600;
+		PD_Prot_pSet(NULL, PD_EPR_SrcCap_RX, NULL, PD_EPR_SrcCap_Timeout);
+		PD_TX_ChunkRequest();
+		PD_PHY_Poll();
+		return;
+	}
+	s_pd_result.chunk_status = PD_RESULT_STATUS_FAIL;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	if ( s_epr_total_size > 0u ) {
 		/* chunk 0 は受信済み — 部分データを表示 */
 		printf("\r\nEPR_Source_Capabilities: chunk 1 timeout — partial data (chunk 0 only):\r\n");
 		PD_EPR_Print_Reconstructed();
+		partial_count = (s_epr_total_size < 24u) ? (u8)(s_epr_total_size / 4u) : 6u;
+		PD_Result_UpdateEPR(s_epr_pdo_buf, partial_count, 0u);
 	} else {
 		printf("\r\nEPR_Source_Capabilities: no response from source\r\n");
 	}
@@ -982,6 +1476,7 @@ static void PD_EPR_SrcCap_RX(void)
 			/* バッファ初期化 */
 			s_epr_total_size = total_size;
 			s_epr_softreset_wait_cnt = 0;
+			s_epr_chunk_request_retry = 0;
 			for ( i = 0u; i < 11u; i++ ) s_epr_pdo_buf[i] = 0u;
 			s_epr_obj7_partial[0] = 0u;
 			s_epr_obj7_partial[1] = 0u;
@@ -999,13 +1494,10 @@ static void PD_EPR_SrcCap_RX(void)
 			}
 
 			if ( need_chunk1 ) {
-				printf("RX EPR_Source_Capabilities chunk 0 (%u bytes, Object 1-Object %u)\r\n",
-				       (unsigned)total_size, (unsigned)num_pdos);
 				/* Arm Cap wait BEFORE Chunk Request so deferred chunk1 has a handler. */
 				PD_PHY.WaitMsgRx = 1;
 				PD_PHY.MsgRxCnt  = 600;
 				PD_Prot_pSet(NULL, PD_EPR_SrcCap_RX, NULL, PD_EPR_SrcCap_Timeout);
-				printf("TX Chunk Request for EPR_Source_Capabilities chunk 1\r\n");
 				PD_TX_ChunkRequest();
 				/* Drain immediately — chunk1 may already be deferred (HKY). */
 				PD_PHY_Poll();
@@ -1018,6 +1510,7 @@ static void PD_EPR_SrcCap_RX(void)
 
 			/* Unchunked or single-chunk: print all PDOs then Exit */
 			PD_EPR_Print_Reconstructed();
+			PD_Result_UpdateEPR(s_epr_pdo_buf, num_pdos, 1u);
 			printf("EPR_Source_Capabilities: complete\r\n");
 			PD_EPR_Exit();
 		} else {
@@ -1043,10 +1536,12 @@ static void PD_EPR_SrcCap_RX(void)
 				s_epr_pdo_buf[7u + i] = (u32)q[0] | ((u32)q[1]<<8) | ((u32)q[2]<<16) | ((u32)q[3]<<24);
 			}
 			s_epr_total_size = (u16)(28u + ((u16)n << 2));
+			s_epr_chunk_request_retry = 0;
 
 			printf("RX EPR_Source_Capabilities chunk 1 (%u EPR PDO%s, payload %uB)\r\n",
 			       (unsigned)n, n == 1u ? "" : "s", (unsigned)payload_len);
 			PD_EPR_Print_Reconstructed();
+			PD_Result_UpdateEPR(s_epr_pdo_buf, (u8)(s_epr_total_size / 4u), 1u);
 			printf("EPR_Source_Capabilities: complete\r\n");
 			PD_EPR_Exit();
 		}
@@ -1071,22 +1566,24 @@ static void PD_EPR_SrcCap_RX(void)
 		u8  action = (u8)(do0 >> 24);
 		if ( action == 0 ) action = (u8)((do0 >> 4) & 0x0F);
 		if ( action == 1 || action == 3 ) {
-			/* Arm Cap wait BEFORE printf — Cap can arrive within ~1ms (aohi-240w/HKY). */
-			s_epr_softreset_wait_cnt = 0;
+			s_pd_result.epr_enter_status = PD_RESULT_STATUS_PASS;
+			s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
+			/* Return from the IRQ immediately; KFD sends Cap about 1.27ms later. */
 			PD_PHY.WaitMsgRx = 1;
 			PD_PHY.MsgRxCnt  = 600;
 			PD_Prot_pSet(NULL, PD_EPR_SrcCap_RX, NULL, PD_EPR_SrcCap_Timeout);
-			printf("EPR Mode: Enter Succeeded (action=%u); waiting for EPR_Source_Capabilities\r\n", (unsigned)action);
 		} else if ( action == 2 ) {
-			s_epr_softreset_wait_cnt = 0;
 			PD_PHY.WaitMsgRx = 1;
 			PD_PHY.MsgRxCnt  = 600;
 			PD_Prot_pSet(NULL, PD_EPR_SrcCap_RX, NULL, PD_EPR_SrcCap_Timeout);
-			printf("EPR_Mode action=2 (re-ACK from source); still waiting for EPR_SrcCap\r\n");
 		} else if ( action == 4 ) {
+			s_pd_result.epr_enter_status = PD_RESULT_STATUS_FAIL;
+			s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 			printf("EPR Mode: Enter rejected — source sent EPR_Mode Exit (action=4); no EPR_Source_Capabilities\r\n");
 			PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 		} else {
+			s_pd_result.epr_enter_status = PD_RESULT_STATUS_FAIL;
+			s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 			printf("EPR Mode: Enter rejected — EPR_Mode action=0x%02X do0=0x%08lX; no EPR_Source_Capabilities\r\n",
 			       (unsigned)action, (unsigned long)do0);
 			PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
@@ -1094,33 +1591,33 @@ static void PD_EPR_SrcCap_RX(void)
 	}
 	else if ( rxHeader->Extended == 0 && rxHeader->NDO == 0 &&
 	          rxHeader->MsgType == PD_Ctrl_SoftReset ) {
-		/* Accept SoftReset; keep waiting Cap a few times (aohi-battery).
-		 * HKY storms SoftReset when Cap GoodCRC was missed — bail after 3. */
+		/* KFD uses Soft Reset after a missed EPR Cap GoodCRC, then retransmits
+		 * EPR Source Capabilities after our Accept. Keep this receive state and
+		 * return from the IRQ without UART output (verified in CY4500 log 086). */
 		if ( s_epr_softreset_wait_cnt >= 3u ) {
-			printf("EPR: Soft_Reset storm while waiting Cap — recover SPR\r\n");
-			s_epr_softreset_wait_cnt = 0;
+			s_pd_result.chunk_status = PD_RESULT_STATUS_NO_RESPONSE;
+			s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
+			s_epr_softreset_wait_cnt = 0u;
 			pProt_RX_SoftRst();
 			return;
 		}
 		s_epr_softreset_wait_cnt++;
-		PD_PHY.TxMsgID = 0;
-		PD_PHY.RxMsgID = 0;
-		txHeader->MsgType       = PD_Ctrl_Accept;
-		txHeader->NDO           = 0;
-		txHeader->MsgID         = 0;
-		txHeader->PortDataRole  = PD_PHY.Header.PortDataRole;
-		txHeader->PortPwrRole   = PD_PHY.Header.PortPwrRole;
-		txHeader->SpecRevision  = PD_PHY.Header.SpecRevision;
-		txHeader->Extended      = 0;
-		PD_PHY.WaitMsgTx = 1;
-		PD_PHY.MsgTxCnt  = 0;
+		PD_PHY.TxMsgID = 0u;
+		PD_PHY.RxMsgID = 0u;
+		txHeader->MsgType      = PD_Ctrl_Accept;
+		txHeader->NDO          = 0u;
+		txHeader->MsgID        = 0u;
+		txHeader->PortDataRole = PD_PHY.Header.PortDataRole;
+		txHeader->PortPwrRole  = PD_PHY.Header.PortPwrRole;
+		txHeader->SpecRevision = PD_PHY.Header.SpecRevision;
+		txHeader->Extended     = 0u;
+		PD_PHY.WaitMsgTx = 1u;
+		PD_PHY.MsgTxCnt  = 0u;
 		PD_PHY_FlushTxNow();
-		printf("EPR: Soft_Reset while waiting SrcCap — Accept, keep waiting Cap (%u/3)\r\n",
-		       (unsigned)s_epr_softreset_wait_cnt);
-		PD_PHY.WaitMsgRx = 1;
-		PD_PHY.MsgRxCnt  = 600;
+		PD_PHY.WaitMsgRx = 1u;
+		PD_PHY.MsgRxCnt  = 600u;
 		PD_Prot_pSet(NULL, PD_EPR_SrcCap_RX, NULL, PD_EPR_SrcCap_Timeout);
-		VDM_Sniff_SOPP_Cable();
+		return;
 	}
 	else if ( rxHeader->Extended == 0 && rxHeader->NDO == 0 ) {
 		printf("EPR_Source_Capabilities: source replied %s (0x%02X) — EPR mode may have been rejected\r\n",
@@ -1139,6 +1636,8 @@ static void PD_EPR_SrcCap_RX(void)
 static void PD_EPR_Mode_NoResponse(void)
 {
 	PD_PHY.WaitMsgRx = 0;
+	s_pd_result.epr_enter_status = PD_RESULT_STATUS_NO_RESPONSE;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	printf("\r\nEPR Mode Enter: no response (source timed out)\r\n");
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 	PD_Source_VDM_Probe_Arm_Delayed(250);
@@ -1148,6 +1647,8 @@ static void PD_EPR_Mode_TxFailed(void)
 {
 	PD_PHY.WaitMsgRx = 0;
 	PD_PHY_Abort();
+	s_pd_result.epr_enter_status = PD_RESULT_STATUS_TX_FAILED;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	printf("\r\nEPR Mode Enter: TX failed (no GoodCRC)\r\n");
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 	PD_Source_VDM_Probe_Arm_Delayed(250);
@@ -1170,16 +1671,17 @@ static void PD_EPR_Mode_Enter_RX(void)
 		if ( action == 0 ) action = (u8)((do0 >> 4) & 0x0F);
 
 		if ( action == 2 ) {  /* Enter Acknowledged */
-			/* Arm wait FIRST — Cap/bidirectional can follow within ~1ms. */
-			s_epr_softreset_wait_cnt = 0;
+			s_pd_result.epr_enter_status = PD_RESULT_STATUS_PENDING;
+			s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
+			/* No UART or VDM work here: the next EPR packet can follow in ~1ms. */
 			PD_PHY.WaitMsgRx = 1;
 			PD_PHY.MsgRxCnt  = 600;
 			PD_Prot_pSet( NULL , PD_EPR_SrcCap_RX , NULL , PD_EPR_SrcCap_Timeout );
-			printf("\r\nEPR Mode: Acknowledged — waiting for bidirectional request\r\n");
-			VDM_Sniff_SOPP_Cable();
 			return;
 		}
 		if ( action == 3 ) {  /* EPR Mode Failed */
+			s_pd_result.epr_enter_status = PD_RESULT_STATUS_FAIL;
+			s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 			printf("\r\nEPR Mode: Enter Failed (action=3)\r\n");
 		} else {
 			printf("\r\nEPR Mode Enter: EPR_Mode action=0x%02X do0=0x%08lX\r\n",
@@ -1249,6 +1751,8 @@ static void __attribute__((unused)) PD_EPR_SinkCap_RX(void)
 static void PD_PPS_Probe_Failed(void)
 {
 	PD_PHY.WaitMsgRx = 0;
+	s_pd_result.pps_probe_status = PD_RESULT_STATUS_FAIL;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	printf("PPS probe: aborted — continuing\r\n");
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 	PD_PPS_Probe_End();
@@ -1314,14 +1818,18 @@ static void PD_PPS_RxStatus(void)
 		u16 out_ma = (u16)(p[2] * 50);
 		printf("PPS Status (after PPS contract %umV): output=%umV/%umA flags=0x%02X\r\n",
 		       (unsigned)s_pps_req_mv, (unsigned)out_mv, (unsigned)out_ma, (unsigned)p[3]);
+		s_pd_result.pps_probe_status = PD_RESULT_STATUS_PASS;
 	} else if ( !rxHeader->Extended && rxHeader->NDO == 0 && rxHeader->MsgType == PD_Ctrl_NotSupported ) {
 		printf("Get_PPS_Status (after PPS contract): Not_Supported\r\n");
+		s_pd_result.pps_probe_status = PD_RESULT_STATUS_UNSUPPORTED;
 	} else if ( !rxHeader->Extended && rxHeader->NDO == 0 && rxHeader->MsgType == PD_Ctrl_SoftReset ) {
 		pProt_RX_SoftRst();
 		return;
 	} else {
 		printf("Get_PPS_Status (after PPS contract): unexpected response 0x%02X\r\n", rxHeader->MsgType);
+		s_pd_result.pps_probe_status = PD_RESULT_STATUS_FAIL;
 	}
+	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	PD_PPS_SendRestoreFixed();
 }
 
@@ -1372,6 +1880,8 @@ static void PD_PPS_RxAccept(void)
 		printf("\r\nPPS probe: Source_Capabilities during PPS Request — restore Fixed PDO1\r\n");
 	} else {
 		/* Reject 等 — 失敗ではなく「非対応」として続行 */
+		s_pd_result.pps_probe_status = PD_RESULT_STATUS_UNSUPPORTED;
+		s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 		printf("\r\nPPS probe: Request not accepted (0x%02X) — continuing\r\n", rxHeader->MsgType);
 		PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 		PD_PPS_Probe_End();
@@ -1400,7 +1910,13 @@ static u8 __attribute__((unused)) PD_PPS_Probe_TryStart(void)
 			}
 		}
 	}
-	if ( best_idx == 0u ) return 0u;  /* PPS APDO なし */
+	if ( best_idx == 0u ) {
+		s_pd_result.pps_probe_status = PD_RESULT_STATUS_NA;
+		s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
+		return 0u;  /* PPS APDO なし */
+	}
+	s_pd_result.pps_probe_status = PD_RESULT_STATUS_PENDING;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 
 	s_pps_pdo_idx  = best_idx;
 	s_pps_orig_obj = PD_Stored_Request_ObjectPos;
@@ -1499,9 +2015,8 @@ void PD_EPR_Enter_Probe_If_Capable(void)
 		PD_Source_VDM_Probe_Arm_Delayed(250);
 		return;
 	}
-	/* EPR_Attempted_FP: 同一 PDO セットへの EPR を MCU リセットまで抑制する。
-	 * pDevice_Attached/Unattached をまたいで保持し、SoftReset 再接続ループを防ぐ。
-	 * 別デバイス（異なる FP）が接続された場合のみ EPR を許可する。 */
+	/* EPR_Attempted_FP: 同一物理接続中の同じ PDO セットへの再試行を抑制する。
+	 * Soft/Hard Reset 復帰では保持し、真の CC 切断時だけクリアする。 */
 	if ( PD_EPR_Attempted_FP != 0
 	  && PD_Current_SrcCap_Fingerprint == PD_EPR_Attempted_FP ) {
 		printf("EPR: already attempted for this PDO set (FP:0x%08lX), skipping.\r\n",
@@ -1511,6 +2026,9 @@ void PD_EPR_Enter_Probe_If_Capable(void)
 		return;
 	}
 	PD_Source_VDM_Probe_Cancel();
+	PD_EPR_Reassembly_Reset();
+	s_pd_result.epr_enter_status = PD_RESULT_STATUS_PENDING;
+	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	PD_EPR_Probe_Done    = 1;
 	PD_EPR_Attempted_FP  = PD_Current_SrcCap_Fingerprint;
 	printf("TX EPR_Mode Enter (source advertised EPRCap=1)\r\n");
@@ -1578,6 +2096,7 @@ static void PD_InfoProbe_SendNext(void)
 static void PD_InfoProbe_RX(void)
 {
 	PD_PHY.WaitMsgRx = 0;
+	PD_InfoProbe_NoResponseCnt = 0;
 	printf("\r\n");  /* PD_PHY_Header_Init が改行なしで "tx" を出力するため、ここで行を区切る */
 
 	if ( PD_Is_Extended_Chunk0_With_More_Data() &&
@@ -1593,6 +2112,7 @@ static void PD_InfoProbe_RX(void)
 	}
 
 	if ( PD_Is_Extended_Chunk0_With_More_Data() ) {
+		PD_Result_RecordProbeStatus(PD_InfoProbe_Step, PD_RESULT_STATUS_PASS);
 		PD_InfoProbe_LogResponse();
 		printf("Probe paused: Extended MsgType 0x%02X has more data; request chunk 1\r\n",
 		       rxHeader->MsgType);
@@ -1619,12 +2139,26 @@ static void PD_InfoProbe_RX(void)
 		PD_InfoProbe_Active = 0;
 		PD_InfoProbe_Step = 0;
 		PD_InfoProbe_TxRetry = 0;
+		PD_Result_RecordProbeStatus(PD_InfoProbe_Step, PD_RESULT_STATUS_REJECTED);
 		VDM_Reset_Disc_State();
 		/* SoftReset に Accept で正しく応答し、再契約フローへ移行 */
 		pProt_RX_SoftRst();
 		return;
 	}
 
+	if ( !rxHeader->Extended && rxHeader->NDO == 0 ) {
+		if ( rxHeader->MsgType == PD_Ctrl_NotSupported ) {
+			PD_Result_RecordProbeStatus(PD_InfoProbe_Step, PD_RESULT_STATUS_UNSUPPORTED);
+		} else if ( rxHeader->MsgType == PD_Ctrl_Reject ) {
+			PD_Result_RecordProbeStatus(PD_InfoProbe_Step, PD_RESULT_STATUS_REJECTED);
+		} else if ( rxHeader->MsgType == PD_Ctrl_Wait ) {
+			PD_Result_RecordProbeStatus(PD_InfoProbe_Step, PD_RESULT_STATUS_BUSY);
+		} else {
+			PD_Result_RecordProbeStatus(PD_InfoProbe_Step, PD_RESULT_STATUS_INVALID);
+		}
+	} else {
+		PD_Result_RecordProbeStatus(PD_InfoProbe_Step, PD_RESULT_STATUS_PASS);
+	}
 	PD_InfoProbe_LogResponse();
 	PD_InfoProbe_Step++;
 	PD_InfoProbe_TxRetry = 0;
@@ -1641,6 +2175,7 @@ static void PD_InfoProbe_RX(void)
 static void PD_InfoProbe_Chunk_RX(void)
 {
 	PD_PHY.WaitMsgRx = 0;
+	PD_InfoProbe_NoResponseCnt = 0;
 	printf("\r\n");
 
 	if ( !rxHeader->Extended && rxHeader->NDO == 0 &&
@@ -1649,6 +2184,7 @@ static void PD_InfoProbe_Chunk_RX(void)
 		       PD_InfoProbe_Name(PD_InfoProbe_Step));
 		PD_InfoProbe_Done = 1;
 		PD_Probed_SrcCap_Fingerprint = PD_Current_SrcCap_Fingerprint;
+		PD_Result_RecordProbeStatus(PD_InfoProbe_Step, PD_RESULT_STATUS_REJECTED);
 		pProt_RX_SoftRst();
 		return;
 	}
@@ -1696,9 +2232,11 @@ static void PD_InfoProbe_TxFailed(void)
 	PD_PHY.MsgTxCnt = 0;
 	PD_PHY.pTxFinish = NULL;
 	PD_PHY.pTxTimeout = NULL;
+	PD_Result_RecordProbeStatus(PD_InfoProbe_Step, PD_RESULT_STATUS_TX_FAILED);
 	PD_InfoProbe_Active = 0;
 	PD_InfoProbe_Step = 0;
 	PD_InfoProbe_TxRetry = 0;
+	PD_InfoProbe_NoResponseCnt = 0;
 	PD_InfoProbe_Done = 1;
 	PD_Probed_SrcCap_Fingerprint = PD_Current_SrcCap_Fingerprint;
 	VDM_Reset_Disc_State();
@@ -1717,6 +2255,20 @@ static void PD_InfoProbe_RxTimeout(void)
 	printf("\r\nProbe %s: no response (GoodCRC received; source ignores silently)\r\n",
 		PD_InfoProbe_Name(PD_InfoProbe_Step));
 	PD_PHY.WaitMsgRx = 0;
+	PD_Result_RecordProbeStatus(PD_InfoProbe_Step, PD_RESULT_STATUS_NO_RESPONSE);
+	PD_InfoProbe_NoResponseCnt++;
+	if ( PD_InfoProbe_NoResponseCnt >= 2u ) {
+		printf("Probe unavailable: two consecutive requests were acknowledged but unanswered; cancel remaining GET_* probes\r\n");
+		PD_InfoProbe_Active = 0;
+		PD_InfoProbe_Step = 0;
+		PD_InfoProbe_TxRetry = 0;
+		PD_InfoProbe_NoResponseCnt = 0;
+		PD_InfoProbe_Done = 1;
+		PD_Probed_SrcCap_Fingerprint = PD_Current_SrcCap_Fingerprint;
+		PD_Prot_pSet(NULL, pProt_IDLE, NULL, NULL);
+		PD_EPR_Enter_Probe_If_Capable();
+		return;
+	}
 	PD_InfoProbe_Step++;
 	PD_InfoProbe_TxRetry = 0;
 	PD_InfoProbe_SendNext();
@@ -1832,6 +2384,7 @@ const u8 enum_Idle_DataMsg[] = {
  */
 void pDevice_Attached(void)
 {
+	PD_Result_OnAttach();
 	PD_PHY_Reset_Value( PD_DEVICE.DevStat );	//Reset PD PHY related counters
 	NVIC_EnableIRQ( USBPD_IRQn );				//Enable PD interrupt
 
@@ -1900,15 +2453,18 @@ void pDevice_Unattached(void)
 	PD_InfoProbe_Step = 0;
 	PD_InfoProbe_Active = 0;
 	PD_InfoProbe_TxRetry = 0;
+	PD_InfoProbe_NoResponseCnt = 0;
 	PD_InfoProbe_Done = 0;
 	PD_EPR_Probe_Done = 0;
 	PD_PPS_Probe_Done = 0;
 	PD_InfoProbe_SoftRst_Recovery_5V_Cnt = 0;
 	s_epr_sinkcap_sent = 0;
 	PD_Probed_SrcCap_Fingerprint = 0;  /* 物理切断: 再接続時に再プローブを許可 */
+	PD_EPR_Attempted_FP = 0;           /* 物理切断: 同じ PDO セットの EPR 再測定を許可 */
 	VDM_Reset_Disc_State();
 	PD_Source_VDM_Probe_Reset();
 	PD_User_DevOut();
+	PD_Result_OnDetach();
 }
 
 /*********************************************************************
@@ -2476,6 +3032,8 @@ void pProt_RX_PS_RDY(void)
 		DEBUG_Print("ADC VBUS:%.2f\r\n",(float)GetADC_VBUS/4096*3.3/33*233);
 		PD_PHY.WaitMsgRx = 0;
 		VDM_State.Explicit_Contract_Established = 1;
+		s_pd_result.spr_contract_status = PD_RESULT_STATUS_PASS;
+		s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 
 		/* 契約確立後に遅延表示: Source_Cap → Request → 結果 の順に出力 */
 		printf("\r\n");  /* PD_PHY_Header_Init が改行なしで "tx" を出力するため、ここで行を区切る */

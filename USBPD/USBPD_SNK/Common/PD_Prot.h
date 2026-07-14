@@ -53,6 +53,27 @@ void pProt_RX_ChunkedMsg(void);
 /* EPR Mode Probe — called from PD_VDM.c after Discover SVIDs completes or times out */
 void PD_EPR_Enter_Probe_If_Capable(void);
 
+/* Machine-readable analyzer result stream (@PD1 records). */
+enum {
+	PD_RESULT_DISC_DONE = 1,
+	PD_RESULT_DISC_NO_RESPONSE,
+	PD_RESULT_DISC_TX_FAILED,
+	PD_RESULT_DISC_NAK,
+	PD_RESULT_DISC_BUSY,
+	PD_RESULT_DISC_REJECTED,
+	PD_RESULT_DISC_INVALID
+};
+
+void PD_Result_OnAttach(void);
+void PD_Result_SetCC(u8 cc);
+void PD_Result_OnDetach(void);
+void PD_Result_Poll(void);
+void PD_Result_SetSourceIdentity(u16 vid, u16 pid, u32 id_header, u32 product_vdo);
+void PD_Result_SetCableIdentity(u16 vid, u16 pid, u8 product_type,
+		u8 current_code, u8 max_voltage_code, u8 usb_speed,
+		u32 id_header, u32 product_vdo, u32 cable_vdo);
+void PD_Result_SetSourceDiscovery(u8 result);
+
 typedef struct {
 	union {
 		u32 Data;

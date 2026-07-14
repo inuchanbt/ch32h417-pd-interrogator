@@ -131,6 +131,7 @@ static void PD_Analyzer_Protocol_Attach(void)
     s_analyzer_connected = 1;
     PD_Analyzer_Notify_Attach(s_analyzer_active_cc);
     pDevice_Attached();
+    PD_Result_SetCC(s_analyzer_active_cc);
 }
 
 /* Select CC + enable BMC; protocol stays off until valid SrcCap. */
@@ -508,9 +509,12 @@ static uint8_t PD_PHY_DoTxNow(void)
     uint8_t  byte_len;
     uint8_t  sop;
     uint16_t wait;
+    uint16_t reply_wait;
     uint8_t  got_crc = 0;
+    uint8_t  epr_enter_tx;
 
     ndo = txHeader->NDO;
+    epr_enter_tx = (uint8_t)(txHeader->MsgType == PD_Data_EPRMode && ndo == 1u);
     /*
      * NDO already counts every 32-bit object after the Message Header.
      * For Extended messages the Extended Header lives inside object 0;
@@ -572,8 +576,15 @@ static uint8_t PD_PHY_DoTxNow(void)
     USBPD->BMC_CLK_CNT = UPD_TMR_RX_120M;
     USBPD->CONTROL |= BMC_START;
 
-    /* ~5ms window for EPR Mode ACK / Accept / Cap after our GoodCRC. */
-    wait = 1700;
+    /*
+     * Most replies arrive within 5ms.  EPR Mode Enter is different: the
+     * source is allowed a full sender-response interval, and KFD sometimes
+     * lands its Mode ACK on the old 5ms poll/RX-rearm boundary.  PD_Rx_Mode()
+     * clears all latched flags, so that race looked exactly like silence.
+     */
+    reply_wait = epr_enter_tx ? 10000u   /* about 30ms */
+                              : 1700u;   /* about 5ms */
+    wait = reply_wait;
     while (--wait) {
         if ((USBPD->STATUS & IF_RX_ACT) == IF_RX_ACT) {
             USBPD->STATUS |= IF_RX_ACT;
@@ -602,12 +613,26 @@ static uint8_t PD_PHY_DoTxNow(void)
 
 reply_inline_ack:
     pd_bytes_to_words(s_irq_rx_buf, PD_Rx_Buf, USBPD->BMC_BYTE_CNT);
-    pd_defer_rx_packet(PD_PHY_RX_SOP);
     PD_PHY.TxMsgID = (uint8_t)((PD_PHY.TxMsgID + 1u) & 0x07u);
     Delay_Us(30);
     PD_Ack_Buf[0] = (uint8_t)(DEF_TYPE_GOODCRC | (PD_Rx_Buf[0] & 0xC0u));
     PD_Ack_Buf[1] = (PD_Rx_Buf[1] & 0x0Eu);
-    PD_Phy_SendPack(0x01, PD_Ack_Buf, 2, UPD_SOP0);
+    /*
+     * Use the same asynchronous TX_END path as IRQ-received packets.  The
+     * former synchronous mode asserted PD_ALL_CLR after GoodCRC and could
+     * erase KFD's immediately following EPR action/Source Cap packet.
+     * TX_END queues this saved packet, restores RX without a destructive
+     * clear, and chains any packet that arrived while GoodCRC was on CC.
+     */
+    if (epr_enter_tx) {
+        PD_PHY.LastRxSop = PD_PHY_RX_SOP;
+        s_waiting_gcrc_tx = 1;
+        PD_Phy_SendPack(0, PD_Ack_Buf, 2, UPD_SOP0);
+    } else {
+        /* Preserve the established synchronous path for SPR/probe traffic. */
+        pd_defer_rx_packet(PD_PHY_RX_SOP);
+        PD_Phy_SendPack(0x01, PD_Ack_Buf, 2, UPD_SOP0);
+    }
     NVIC_EnableIRQ(USBPD_IRQn);
     return 1;
 }
@@ -1313,6 +1338,7 @@ void PD_Analyzer_Init(void)
     PD_Analyzer_Reset_Attach_State();
     printf("PD init: analyzer, %s Rd\r\n",
            PD_SNK_USE_INTERNAL_RD ? "internal CC_PD controlled" : "external 5.1k");
+    printf("@PD1,type=boot,session=0\r\n");
 }
 
 void PD_Analyzer_Det_Proc(void)

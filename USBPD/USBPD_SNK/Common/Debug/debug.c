@@ -184,9 +184,21 @@ void USART_Printf_Init(uint32_t baudrate)
  *
  * @return  size: Data length
  */
+static volatile int s_debug_uart_write_busy;
+
 __attribute__((used)) int _write(int fd, char *buf, int size)
 {
     int i = 0;
+
+    /* printf can be called from both the PD path and an interrupt.  A nested
+     * writer may pass TC and overwrite DATAR before the interrupted writer
+     * sends its byte.  Drop only the nested diagnostic message; never spin in
+     * an interrupt and never delay PD IRQ handling with a long critical section. */
+    if(s_debug_uart_write_busy)
+    {
+        return size;
+    }
+    s_debug_uart_write_busy = 1;
 
     for(i = 0; i < size; i++)
     {
@@ -201,6 +213,8 @@ __attribute__((used)) int _write(int fd, char *buf, int size)
         USART_SendData(USART6, *buf++);
 #endif
     }
+
+    s_debug_uart_write_busy = 0;
 
     return size;
 }
@@ -224,6 +238,5 @@ __attribute__((used)) void *_sbrk(ptrdiff_t incr)
     curbrk += incr;
     return curbrk - incr;
 }
-
 
 

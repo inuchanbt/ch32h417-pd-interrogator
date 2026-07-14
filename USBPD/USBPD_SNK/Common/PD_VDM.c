@@ -73,7 +73,7 @@ static void VDM_Print_Cable_Identity_ACK(const char *via);
 static void VDM_Cable_Enable_Vconn(void);
 static void VDM_Cable_Disable_Vconn(void);
 static void VDM_Try_Passive_SOPP(void);
-static void VDM_Source_Probe_Finish(const char *reason);
+static void VDM_Source_Probe_Finish(const char *reason, u8 result);
 void pProt_TX_DISC_MODES_Next(void);
 
 static u32 VDM_Read_DO(u8 index)
@@ -280,6 +280,7 @@ static void VDM_Print_Discover_Identity_ACK(const char *role)
 	if ( (vid == 0) && (pid == 0) ) {
 		printf("Identity result: SOP ACK received, VID/PID are zero.\r\n");
 	}
+	PD_Result_SetSourceIdentity(vid, pid, id_header, product);
 }
 
 /* ===================================================================
@@ -401,6 +402,8 @@ static void VDM_Print_Cable_Identity_ACK(const char *via)
 	if ( rxHeader->NDO >= 6 ) {
 		printf("  Cable VDO2:0x%08lX\r\n", (unsigned long)VDM_Read_DO(5));
 	}
+	PD_Result_SetCableIdentity(vid, pid, product_type, curr_cap, max_v,
+	                           usb_speed, id_header, product, cable_vdo);
 
 	s_cable_identity_logged = 1;
 	PD_Cable_Probe_Done     = 1;
@@ -552,7 +555,7 @@ static void VDM_Disc_SvidTimeout(void)
 {
 	PD_PHY.WaitMsgRx = 0;
 	printf("\r\nDiscover SVIDs: no response (source ignored request — normal for power-only DFPs)\r\n");
-	VDM_Source_Probe_Finish("Discover SVIDs timeout");
+	VDM_Source_Probe_Finish("Discover SVIDs timeout", PD_RESULT_DISC_NO_RESPONSE);
 }
 
 /* ── Discover Modes タイムアウト ── */
@@ -600,7 +603,7 @@ void pProt_TX_DISC_MODES_Next(void)
 	u16 svid;
 	if ( VDM_Disc_Mode_Index >= VDM_Disc_SVID_Count ) {
 		printf("Discover Modes complete (all %d SVIDs)\r\n", VDM_Disc_SVID_Count);
-		VDM_Source_Probe_Finish("all SVID modes visited");
+		VDM_Source_Probe_Finish("all SVID modes visited", PD_RESULT_DISC_DONE);
 		return;
 	}
 	svid = VDM_Disc_SVIDs[VDM_Disc_Mode_Index];
@@ -627,11 +630,12 @@ void VDM_Reset_Disc_State(void)
 	VDM_Reset_Cable_State();
 }
 
-static void VDM_Source_Probe_Finish(const char *reason)
+static void VDM_Source_Probe_Finish(const char *reason, u8 result)
 {
 	PD_PHY.WaitMsgTx = 0;
 	PD_PHY.WaitMsgRx = 0;
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+	PD_Result_SetSourceDiscovery(result);
 	printf("SOP source discovery complete: %s\r\n", reason);
 }
 
@@ -702,16 +706,16 @@ void pProt_RX_VDM(void)
 		} else if ( !rxHeader->Extended && rxHeader->NDO == 0 &&
 		            ( rxHeader->MsgType == PD_Ctrl_Reject ||
 		              rxHeader->MsgType == PD_Ctrl_NotSupported ) ) {
-			VDM_Source_Probe_Finish("source rejected discovery");
+			VDM_Source_Probe_Finish("source rejected discovery", PD_RESULT_DISC_REJECTED);
 		} else {
-			VDM_Source_Probe_Finish("unexpected SOP response");
+			VDM_Source_Probe_Finish("unexpected SOP response", PD_RESULT_DISC_INVALID);
 		}
 		return;
 	}
 	if ( rxVDM->Command < PD_VDM_DiscoverIdentity ||
 	     rxVDM->Command > PD_VDM_Attention ) {
 		printf("RX malformed VDM command:0x%02X\r\n", (unsigned)rxVDM->Command);
-		VDM_Source_Probe_Finish("invalid VDM command");
+		VDM_Source_Probe_Finish("invalid VDM command", PD_RESULT_DISC_INVALID);
 		return;
 	}
 
@@ -734,16 +738,16 @@ void pProt_RX_VDM(void)
 		void (*handler)(void) = VDM_ACK_Msg_Handle[(rxVDM->Command)-1]
 		                                          [(PD_PHY.Header.PortDataRole)?(0):(1)];
 		if ( handler ) handler();
-		else VDM_Source_Probe_Finish("unexpected VDM ACK");
+		else VDM_Source_Probe_Finish("unexpected VDM ACK", PD_RESULT_DISC_INVALID);
 	}
 	else if ( rxVDM->CommandType == 0x02 ) {
-		VDM_Source_Probe_Finish("source returned VDM NAK");
+		VDM_Source_Probe_Finish("source returned VDM NAK", PD_RESULT_DISC_NAK);
 	}
 	else if ( rxVDM->CommandType == 0x03 ) {
-		VDM_Source_Probe_Finish("source returned VDM BUSY");
+		VDM_Source_Probe_Finish("source returned VDM BUSY", PD_RESULT_DISC_BUSY);
 	}
 	else {
-		VDM_Source_Probe_Finish("invalid VDM command type");
+		VDM_Source_Probe_Finish("invalid VDM command type", PD_RESULT_DISC_INVALID);
 	}
 }
 
@@ -851,7 +855,7 @@ static void pDiscIdent_TxFailed(void)
 	 */
 	PD_PHY.WaitMsgRx = 0;
 	printf("\r\nDiscover Identity TX failed (no GoodCRC): VDM/SOP may not be supported by this source.\r\n");
-	VDM_Source_Probe_Finish("Discover Identity TX failed");
+	VDM_Source_Probe_Finish("Discover Identity TX failed", PD_RESULT_DISC_TX_FAILED);
 }
 
 static void pDiscIdent_NoResponse(void)
@@ -859,7 +863,7 @@ static void pDiscIdent_NoResponse(void)
 	/* GoodCRC は受け取ったが ACK が返ってこなかった（~30ms タイムアウト） */
 	PD_PHY.WaitMsgRx = 0;
 	printf("\r\nDiscover Identity: no response (source ignored request)\r\n");
-	VDM_Source_Probe_Finish("Discover Identity timeout");
+	VDM_Source_Probe_Finish("Discover Identity timeout", PD_RESULT_DISC_NO_RESPONSE);
 }
 
 void pProt_TX_DISC_IDENT(void)
@@ -939,7 +943,7 @@ void pProt_RX_ACK_SVID_DFP(void)
 
 	if ( VDM_Disc_SVID_Count == 0 ) {
 		printf("No SVIDs returned; Discover Modes skipped\r\n");
-		VDM_Source_Probe_Finish("source returned no SVIDs");
+		VDM_Source_Probe_Finish("source returned no SVIDs", PD_RESULT_DISC_DONE);
 		return;
 	}
 

@@ -70,6 +70,8 @@ typedef volatile u8 vu8;
 #define PD_Ext_FWUpdateRequest      0x0A
 #define PD_Ext_FWUpdateResponse     0x0B
 #define PD_Ext_PPSStatus            0x0C
+#define PD_Ext_CountryInfo          0x0D
+#define PD_Ext_CountryCodes         0x0E
 #define PD_Ext_SinkCapExtended      0x0F
 #define PD_Ext_EPRSrcCapabilities   0x11
 
