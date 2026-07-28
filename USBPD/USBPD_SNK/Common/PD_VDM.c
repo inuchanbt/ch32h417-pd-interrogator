@@ -773,13 +773,21 @@ void pProt_RX_REQ_IDENT_UFP(void)
 
 void pProt_RX_REQ_SVID_UFP(void)
 {
+	/*
+	 * This analyzer does not expose a USB Alt Mode SVID.  Return a valid empty
+	 * Discover SVIDs ACK: one zero-filled SVID VDO terminates the list.  The
+	 * stock sample's synthetic 0xFF01 response falsely advertises DisplayPort.
+	 * Timing-sensitive Request/EPR transitions return BUSY before this generic
+	 * responder is reached.
+	 */
 	memcpy( &PD_TX_BUF[1], &rxVDM->Data, 4 );
 	txVDM->CommandType = 1;
 	if ( rxVDM->VersionMajor > 1 ) {
 		txVDM->VersionMajor = (rxHeader->SpecRevision == PD_Rev3) ? 1 : 0;
 	}
-	memcpy( &PD_TX_BUF[3], VDM_SVID, sizeof(VDM_SVID) );
-	PD_PHY_Header_Init(5, (sizeof(VDM_SVID)/4)+1, PD_Data_VendorDefined);
+	PD_TX_BUF[3] = 0x0000;
+	PD_TX_BUF[4] = 0x0000;
+	PD_PHY_Header_Init(5, 2, PD_Data_VendorDefined);
 	PD_Prot_pSet( NULL , pProt_IDLE , pProt_TX_SoftRst , NULL );
 }
 

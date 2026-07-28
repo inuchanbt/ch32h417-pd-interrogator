@@ -5,14 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Iterable, TextIO
 
-from pd_report import generate_reports
+from pd_report import DEFAULT_CAPTURES, generate_reports
 
 try:
     import serial
@@ -24,6 +26,35 @@ except ImportError:  # pragma: no cover - exercised only on missing dependency
 
 RECORD_PREFIX = "@PD1,"
 KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+CABLE_VDO_RE = re.compile(r"^\s*(Passive|Active) Cable VDO1:0x([0-9A-Fa-f]{8})\s*$")
+EXT_PAYLOAD_BYTE_RE = re.compile(r"\[(\d+)\]=([0-9A-Fa-f]{2})")
+WRITE_RETRY_COUNT = 40
+WRITE_RETRY_DELAY_S = 0.05
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Replace a text file atomically, tolerating short Windows file locks."""
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+    )
+    temporary.write_text(text, encoding=encoding)
+    try:
+        for attempt in range(WRITE_RETRY_COUNT):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError:
+                if attempt + 1 >= WRITE_RETRY_COUNT:
+                    raise
+                time.sleep(WRITE_RETRY_DELAY_S)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # A stale hidden temporary is preferable to losing the capture.
+            pass
 
 
 def parse_record(line: str) -> dict[str, str] | None:
@@ -87,6 +118,80 @@ def display_status(value: str | None) -> str:
     return names.get(value or "unknown", (value or "unknown").upper())
 
 
+def decode_cable_vdo_from_log(line: str) -> dict[str, str] | None:
+    """Recover a passively sniffed SOP' Cable VDO before the MCU emits @PD1."""
+    match = CABLE_VDO_RE.match(line)
+    if match is None:
+        return None
+    cable_type_name, raw = match.groups()
+    vdo = int(raw, 16)
+    current_code = (vdo >> 5) & 0x03
+    current_ma = {1: 3000, 2: 5000}.get(current_code, 0)
+    voltage_code = (vdo >> 9) & 0x03
+    max_mv = (20000, 30000, 40000, 48000)[voltage_code]
+    speed_code = vdo & 0x07
+    speed_name = {
+        0: "usb2", 1: "usb3_gen1", 2: "usb4_gen2",
+        3: "usb4_gen3", 4: "usb4_gen4",
+    }.get(speed_code, "unknown")
+    cable_type = "3" if cable_type_name == "Passive" else "4"
+    return {
+        "format": "PD1",
+        "type": "cable",
+        "status": "pass",
+        "captured_via": "passive_raw_log",
+        "cable_type": cable_type,
+        "cable_type_name": cable_type_name.lower(),
+        "current_ma": str(current_ma),
+        "cable_current_a": str(current_ma // 1000),
+        "max_mv": str(max_mv),
+        "cable_max_voltage_v": str(max_mv // 1000),
+        "usb_speed": str(speed_code),
+        "usb_speed_name": speed_name,
+        "cable_vdo_version": str((vdo >> 21) & 0x07),
+        "cable_latency": str((vdo >> 13) & 0x0F),
+        "cable_termination": str((vdo >> 11) & 0x03),
+        "cable_vdo": raw.upper(),
+    }
+
+
+def decode_source_cap_ext_from_log(line: str) -> dict[str, str] | None:
+    """Decode the 24/25-byte Source Capabilities Extended payload in raw logs."""
+    if "EXT payload bytes:" not in line:
+        return None
+    payload: dict[int, int] = {
+        int(index): int(value, 16)
+        for index, value in EXT_PAYLOAD_BYTE_RE.findall(line)
+    }
+    if not all(index in payload for index in range(24)):
+        return None
+    size = max(payload) + 1
+    return {
+        "format": "PD1",
+        "type": "source_cap_ext",
+        "captured_via": "passive_raw_log",
+        "size": str(size),
+        "vid": f"{payload[0] | (payload[1] << 8):04X}",
+        "pid": f"{payload[2] | (payload[3] << 8):04X}",
+        "xid": f"{payload[4] | (payload[5] << 8) | (payload[6] << 16) | (payload[7] << 24):08X}",
+        "fw_version": str(payload[8]),
+        "hw_version": str(payload[9]),
+        "voltage_regulation_raw": str(payload[10]),
+        "hold_up_time_raw": str(payload[11]),
+        "compliance_raw": str(payload[12]),
+        "touch_current_raw": str(payload[13]),
+        "peak_current_1_raw": str(payload[14] | (payload[15] << 8)),
+        "peak_current_2_raw": str(payload[16] | (payload[17] << 8)),
+        "peak_current_3_raw": str(payload[18] | (payload[19] << 8)),
+        "touch_temperature_raw": str(payload[20]),
+        "source_inputs_raw": str(payload[21]),
+        "fixed_batteries": str(payload[22] & 0x0F),
+        "swappable_batteries": str((payload[22] >> 4) & 0x0F),
+        "spr_pdp_w": str(payload[23]),
+        "epr_pdp_w": str(payload.get(24, 0)),
+    }
+
+
 @dataclass
 class SessionState:
     session: int
@@ -130,6 +235,11 @@ class SessionState:
         elif kind == "identity":
             self.identity.update(record)
         elif kind == "cable":
+            # Older firmware emits an all-zero/unknown cable record at detach
+            # even when an early passive SOP' observation was recovered from
+            # raw.log. Never discard the stronger observation.
+            if self.cable.get("status") == "pass" and record.get("status") != "pass":
+                return
             self.cable.update(record)
         elif kind == "probe":
             name = record.get("name", "unknown")
@@ -231,12 +341,22 @@ class SessionState:
         if source_cap_ext:
             if not detail_lines:
                 detail_lines.extend(["", "[Source Details]"])
-            detail_lines.append(
-                "Source Cap Ext : "
-                f"VID 0x{source_cap_ext.get('vid', '0000')} / "
-                f"PID 0x{source_cap_ext.get('pid', '0000')} / "
-                f"XID 0x{source_cap_ext.get('xid', '00000000')}"
-            )
+            ext_parts = [
+                f"VID 0x{source_cap_ext.get('vid', '0000')}",
+                f"PID 0x{source_cap_ext.get('pid', '0000')}",
+                f"XID 0x{source_cap_ext.get('xid', '00000000')}",
+            ]
+            if source_cap_ext.get("fw_version") or source_cap_ext.get("hw_version"):
+                ext_parts.append(
+                    f"FW {source_cap_ext.get('fw_version', '?')} / "
+                    f"HW {source_cap_ext.get('hw_version', '?')}"
+                )
+            if source_cap_ext.get("spr_pdp_w"):
+                pdp = f"SPR PDP {source_cap_ext['spr_pdp_w']}W"
+                if source_cap_ext.get("epr_pdp_w"):
+                    pdp += f" / EPR PDP {source_cap_ext['epr_pdp_w']}W"
+                ext_parts.append(pdp)
+            detail_lines.append("Source Cap Ext : " + " / ".join(ext_parts))
         source_info = self.probe_details.get("source_info", {})
         if source_info:
             if not detail_lines:
@@ -343,36 +463,105 @@ class SessionState:
 
 
 class CaptureRun:
-    def __init__(self, output: Path, label: str = "", verbose: bool = False) -> None:
+    def __init__(
+        self,
+        output: Path,
+        source_id: str = "",
+        cable_id: str = "",
+        cable_attachment: str = "unknown",
+        source_manufacturer: str = "",
+        source_model: str = "",
+        source_port: str = "",
+        cable_manufacturer: str = "",
+        cable_model: str = "",
+        cable_length_m: float | None = None,
+        input_ac_voltage_v: float = 100.0,
+        input_ac_frequency_hz: float = 50.0,
+        verbose: bool = False,
+    ) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        suffix = "_" + re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-") if label else ""
+        source_id = source_id.strip()
+        cable_id = cable_id.strip()
+        source_manufacturer = source_manufacturer.strip()
+        source_model = source_model.strip()
+        if cable_attachment == "captive" and not cable_id and source_id:
+            cable_id = f"{source_id}:captive"
+        source_folder_parts = []
+        for value in (source_manufacturer, source_model):
+            safe_value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+            if safe_value:
+                source_folder_parts.append(safe_value)
+        suffix = "_" + "_".join(source_folder_parts) if source_folder_parts else ""
         self.root = output / f"{stamp}{suffix}"
         serial_number = 1
         while self.root.exists():
             self.root = output / f"{stamp}{suffix}_{serial_number:02d}"
             serial_number += 1
         self.root.mkdir(parents=True, exist_ok=False)
+        self.source_id = source_id
+        self.cable_id = cable_id
+        self.cable_attachment = cable_attachment
+        self.setup_metadata = {
+            "source_manufacturer": source_manufacturer,
+            "source_model": source_model,
+            "source_port": source_port.strip(),
+            "cable_manufacturer": cable_manufacturer.strip(),
+            "cable_model": cable_model.strip(),
+            "cable_length_m": cable_length_m,
+            "input_ac_voltage_v": input_ac_voltage_v,
+            "input_ac_frequency_hz": input_ac_frequency_hz,
+        }
+        (self.root / "capture.json").write_text(
+            json.dumps(
+                {
+                    "format": "PD_CAPTURE_1",
+                    "source_id": source_id,
+                    "cable_id": cable_id,
+                    "cable_attachment": cable_attachment,
+                    **self.setup_metadata,
+                },
+                indent=2,
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
         self.verbose = verbose
         self.raw_binary: BinaryIO = (self.root / "raw.bin").open("wb")
         self.raw_text: TextIO = (self.root / "raw.log").open("w", encoding="utf-8", newline="")
         self.events: TextIO = (self.root / "events.jsonl").open("w", encoding="utf-8")
         self.sessions: dict[int, SessionState] = {}
         self.session_files: dict[int, tuple[Path, TextIO, TextIO]] = {}
+        self.pending_passive_cable: dict[str, str] | None = None
+        self.pending_source_cap_ext_session: int | None = None
         self.current_session: int | None = None
         self.next_session = 0
         self.force_new_session = False
         self.last_shown_summary: dict[int, str] = {}
         self.buffer = bytearray()
         self.pending_lines: list[str] = []
+        self.closed = False
 
     def feed(self, data: bytes) -> None:
         self.raw_binary.write(data)
         self.raw_binary.flush()
         self.buffer.extend(data)
-        while b"\n" in self.buffer:
-            raw_line, _, remainder = self.buffer.partition(b"\n")
-            self.buffer = bytearray(remainder)
-            self.process_line(raw_line + b"\n")
+        while True:
+            cr = self.buffer.find(b"\r")
+            lf = self.buffer.find(b"\n")
+            separators = [index for index in (cr, lf) if index >= 0]
+            if not separators:
+                break
+            line_end = min(separators)
+            terminator_end = line_end + 1
+            if (
+                self.buffer[line_end] == 0x0D
+                and terminator_end < len(self.buffer)
+                and self.buffer[terminator_end] == 0x0A
+            ):
+                terminator_end += 1
+            raw_line = bytes(self.buffer[:terminator_end])
+            del self.buffer[:terminator_end]
+            self.process_line(raw_line)
 
     def process_line(self, raw_line: bytes) -> None:
         line = raw_line.decode("utf-8", errors="replace")
@@ -380,6 +569,18 @@ class CaptureRun:
         self.raw_text.flush()
         if self.verbose:
             print(line, end="")
+
+        passive_cable = decode_cable_vdo_from_log(line)
+        if passive_cable is not None:
+            self.pending_passive_cable = passive_cable
+        source_cap_ext = decode_source_cap_ext_from_log(line)
+        if source_cap_ext is not None and self.pending_source_cap_ext_session is not None:
+            state = self.sessions.get(self.pending_source_cap_ext_session)
+            if state is not None:
+                source_cap_ext["session"] = str(state.firmware_session)
+                state.apply(source_cap_ext)
+                self._save_session(state)
+            self.pending_source_cap_ext_session = None
 
         record = parse_record(line)
         if record is not None and record.get("type") == "boot":
@@ -399,6 +600,7 @@ class CaptureRun:
         if firmware_session <= 0:
             self._write_session_line(line)
             return
+        kind = record.get("type")
         state, started = self._route_session(record, firmware_session)
         if started:
             session_raw = self.session_files[state.session][1]
@@ -407,6 +609,19 @@ class CaptureRun:
         self.session_files[state.session][1].write(line)
         self.session_files[state.session][1].flush()
         state.apply(record)
+        if kind == "source_cap_ext" or (
+            kind == "probe"
+            and record.get("name") == "source_cap_ext"
+            and record.get("status") == "pass"
+        ):
+            self.pending_source_cap_ext_session = state.session
+        if started and kind == "attach" and self.pending_passive_cable is not None:
+            recovered = {
+                **self.pending_passive_cable,
+                "session": str(firmware_session),
+            }
+            state.apply(recovered)
+            self.pending_passive_cable = None
         self._write_global_event(record, state.session)
         envelope = self._event_envelope(record, state.session)
         self.session_files[state.session][2].write(
@@ -415,7 +630,6 @@ class CaptureRun:
         self.session_files[state.session][2].flush()
         self._save_session(state)
 
-        kind = record.get("type")
         if kind == "result" and record.get("complete") == "1":
             self._show_summary(state, "measurement complete")
         elif kind == "result" and state.protocol_measurement_ready():
@@ -489,11 +703,28 @@ class CaptureRun:
 
     def _save_session(self, state: SessionState) -> None:
         folder = self.session_files[state.session][0]
-        (folder / "summary.txt").write_text(state.render_summary(), encoding="utf-8")
-        (folder / "result.json").write_text(
-            json.dumps(state.as_json(), indent=2, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
+        result = state.as_json()
+        result["source_id"] = self.source_id
+        result["cable_id"] = self.cable_id
+        result["cable_attachment"] = self.cable_attachment
+        result.update(self.setup_metadata)
+        files = (
+            (folder / "summary.txt", state.render_summary()),
+            (
+                folder / "result.json",
+                json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True)
+                + "\n",
+            ),
         )
+        for path, contents in files:
+            try:
+                atomic_write_text(path, contents)
+            except OSError as exc:
+                print(
+                    f"Warning: could not update session {state.session} "
+                    f"{path.name}; keeping the previous saved version: {exc}",
+                    file=sys.stderr,
+                )
 
     def _show_summary(self, state: SessionState, reason: str) -> None:
         summary = state.render_summary()
@@ -511,21 +742,36 @@ class CaptureRun:
         print(summary, end="")
 
     def close(self) -> None:
-        if self.buffer:
-            self.process_line(bytes(self.buffer))
-            self.buffer.clear()
-        for state in self.sessions.values():
-            self._save_session(state)
-        for _, raw, events in self.session_files.values():
-            raw.close()
-            events.close()
-        self.raw_binary.close()
-        self.raw_text.close()
-        self.events.close()
+        if self.closed:
+            return
+        try:
+            if self.buffer:
+                self.process_line(bytes(self.buffer))
+                self.buffer.clear()
+            for state in self.sessions.values():
+                self._save_session(state)
+        finally:
+            for _, raw, events in self.session_files.values():
+                raw.close()
+                events.close()
+            self.raw_binary.close()
+            self.raw_text.close()
+            self.events.close()
+            self.closed = True
+
+        # Capture artifacts are durable before rebuilding the aggregate reports.
         try:
             html_path, csv_path, count = generate_reports(self.root.parent)
             print(f"Spec table updated: {html_path} ({count} sessions)")
             print(f"CSV updated: {csv_path}")
+            print(f"Source CSV updated: {self.root.parent / 'source_table.csv'}")
+            print(f"PDO CSV updated: {self.root.parent / 'pdo_table.csv'}")
+            print(f"Cable CSV updated: {self.root.parent / 'cable_table.csv'}")
+        except KeyboardInterrupt:
+            print(
+                "Report update interrupted; capture files were saved successfully.",
+                file=sys.stderr,
+            )
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             print(f"Warning: could not update spec table: {exc}", file=sys.stderr)
 
@@ -565,19 +811,76 @@ def capture_serial(port: str, baud: int, capture: CaptureRun) -> None:
     if serial is None:
         raise SystemExit("pyserial is required: python -m pip install pyserial")
     print(f"Capturing {port} at {baud} baud. Press Ctrl+C to stop.")
-    with serial.Serial(port=port, baudrate=baud, timeout=0.1) as device:
-        while True:
-            data = device.read(4096)
-            if data:
-                capture.feed(data)
+    reconnecting = False
+    while True:
+        try:
+            with serial.Serial(port=port, baudrate=baud, timeout=0.1) as device:
+                if reconnecting:
+                    print(f"Serial reconnected: {port}")
+                    reconnecting = False
+                while True:
+                    data = device.read(4096)
+                    if data:
+                        capture.feed(data)
+        except (serial.SerialException, OSError) as exc:
+            if not reconnecting:
+                print(
+                    f"Serial connection lost ({exc}); retrying {port}. "
+                    "Press Ctrl+C to stop.",
+                    file=sys.stderr,
+                )
+            reconnecting = True
+            time.sleep(0.5)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", help="serial port (auto-selected when unambiguous)")
     parser.add_argument("--baud", type=int, default=921600)
-    parser.add_argument("--output", type=Path, default=Path("captures"))
-    parser.add_argument("--label", default="", help="optional run-name suffix")
+    parser.add_argument("--output", type=Path, default=DEFAULT_CAPTURES)
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument("--source-id", default="", help="stable source identifier")
+    source_group.add_argument(
+        "--label", dest="source_id", help="deprecated alias for --source-id"
+    )
+    parser.add_argument("--cable-id", default="", help="stable physical cable identifier")
+    parser.add_argument(
+        "--cable-attachment",
+        choices=("unknown", "detachable", "captive"),
+        default="unknown",
+        help="whether the cable is replaceable or permanently attached",
+    )
+    parser.add_argument("--source-manufacturer", default="", help="source manufacturer")
+    parser.add_argument("--source-model", default="", help="source model")
+    parser.add_argument(
+        "--source-port",
+        default="",
+        help="source connection port, for example C1",
+    )
+    parser.add_argument("--cable-manufacturer", default="", help="cable manufacturer")
+    parser.add_argument("--cable-model", default="", help="cable model")
+    parser.add_argument(
+        "--cable-length-m",
+        type=float,
+        default=None,
+        help="cable length in metres",
+    )
+    parser.add_argument(
+        "--input-ac-voltage",
+        "--input-ac-voltage-v",
+        dest="input_ac_voltage_v",
+        type=float,
+        default=100.0,
+        help="input AC voltage in volts (default: 100)",
+    )
+    parser.add_argument(
+        "--input-ac-frequency",
+        "--input-ac-frequency-hz",
+        dest="input_ac_frequency_hz",
+        type=float,
+        default=50.0,
+        help="input AC frequency in hertz (default: 50)",
+    )
     parser.add_argument("--verbose", action="store_true", help="echo all firmware debug lines")
     parser.add_argument("--list", action="store_true", help="list serial ports and exit")
     parser.add_argument("--replay", type=Path, help="parse a saved UART log instead of a COM port")
@@ -585,13 +888,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.input_ac_voltage_v <= 0:
+        parser.error("--input-ac-voltage must be greater than zero")
+    if args.input_ac_frequency_hz <= 0:
+        parser.error("--input-ac-frequency must be greater than zero")
+    if args.cable_length_m is not None and args.cable_length_m < 0:
+        parser.error("--cable-length-m must be zero or greater")
     if args.list:
         for port in available_ports():
             print(f"{port.device}\t{port.description}\tVID={getattr(port, 'vid', None)!r}")
         return 0
 
-    capture = CaptureRun(args.output, args.label, args.verbose)
+    capture = CaptureRun(
+        args.output,
+        source_id=args.source_id,
+        cable_id=args.cable_id,
+        cable_attachment=args.cable_attachment,
+        source_manufacturer=args.source_manufacturer,
+        source_model=args.source_model,
+        source_port=args.source_port,
+        cable_manufacturer=args.cable_manufacturer,
+        cable_model=args.cable_model,
+        cable_length_m=args.cable_length_m,
+        input_ac_voltage_v=args.input_ac_voltage_v,
+        input_ac_frequency_hz=args.input_ac_frequency_hz,
+        verbose=args.verbose,
+    )
     print(f"Capture directory: {capture.root.resolve()}")
     try:
         if args.replay:
@@ -601,7 +925,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\nCapture stopped.")
     finally:
-        capture.close()
+        try:
+            capture.close()
+        except KeyboardInterrupt:
+            print(
+                "Capture shutdown interrupted after closing available files.",
+                file=sys.stderr,
+            )
     return 0
 
 

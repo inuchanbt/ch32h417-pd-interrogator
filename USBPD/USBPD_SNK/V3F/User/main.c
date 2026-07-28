@@ -56,7 +56,7 @@ int main(void)
 	SystemAndCoreClockUpdate();
 	Delay_Init();
 	Delay_Ms(100);
-	USART_Printf_Init(921600);
+	USART_Printf_Init(460800);
 	Delay_Ms(1000);
 
 	printf("SystemClk:%d\r\n", SystemClock);

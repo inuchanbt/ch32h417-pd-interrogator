@@ -19,6 +19,8 @@ static __attribute__((aligned(4))) uint16_t s_irq_rx_buf[28];
 #define PD_RX_DEFER_QUEUE_LEN 4u
 static __attribute__((aligned(4))) uint16_t s_deferred_rx_queue[PD_RX_DEFER_QUEUE_LEN][28];
 static uint8_t s_deferred_rx_sop[PD_RX_DEFER_QUEUE_LEN];
+static uint32_t s_deferred_rx_sequence[PD_RX_DEFER_QUEUE_LEN];
+static uint32_t s_deferred_rx_timestamp_ms[PD_RX_DEFER_QUEUE_LEN];
 
 st_Prot_Header     *rxHeader    = (st_Prot_Header *)PD_RX_BUF;
 st_Prot_Header     *txHeader    = (st_Prot_Header *)PD_TX_BUF;
@@ -542,6 +544,8 @@ static uint8_t PD_PHY_DoTxNow(void)
      * state, then soft-poll for the reply before enabling IRQ.
      */
     NVIC_DisableIRQ(USBPD_IRQn);
+    PD_PHY.TxStartRxSequence = PD_PHY.RxSequence;
+    PD_PHY.TxStartTimestampMs = PD_PHY.TimeMs;
     s_waiting_gcrc_tx = 0;
     s_pending_rx      = 0;
     USBPD->CONTROL &= ~(PD_TX_EN | BMC_START);
@@ -606,6 +610,16 @@ static uint8_t PD_PHY_DoTxNow(void)
         Delay_Us(3);
     }
 
+    /*
+     * A quiet bus is not TX success.  The old path advanced Message ID and
+     * called pTxFinish even when no GoodCRC had arrived.  A later unrelated
+     * source VDM was then mistaken for the response to a corrupt probe.
+     */
+    if (!got_crc) {
+        PD_Rx_Mode();
+        NVIC_EnableIRQ(USBPD_IRQn);
+        return 0;
+    }
     PD_PHY.TxMsgID = (uint8_t)((PD_PHY.TxMsgID + 1u) & 0x07u);
     PD_Rx_Mode();
     NVIC_EnableIRQ(USBPD_IRQn);
@@ -671,6 +685,12 @@ void PD_PHY_Reset_Value(uint8_t role)
     PD_PHY.RxSop = PD_PHY_RX_SOP;
     PD_PHY.LastRxSop = 0;
     PD_PHY.TxSop = PD_PHY_TX_SOP;
+    PD_PHY.TimeMs = 0;
+    PD_PHY.RxSequence = 0;
+    PD_PHY.LastRxSequence = 0;
+    PD_PHY.LastRxTimestampMs = 0;
+    PD_PHY.TxStartRxSequence = 0;
+    PD_PHY.TxStartTimestampMs = 0;
     PD_PHY.ListenOnlySopp = 0;
     s_waiting_gcrc_tx   = 0;
     pd_clear_deferred_rx();
@@ -708,7 +728,7 @@ void PD_PHY_Header_Init(uint8_t cnt, uint8_t ndo, uint8_t msg_type)
     txHeader->Extended      = 0;
     PD_PHY.WaitMsgTx = 1;
     PD_PHY.MsgTxCnt  = 0;
-    printf("tx");
+    printf("tx\r\n");
 }
 
 static void PD_PHY_SendPending(void)
@@ -744,15 +764,19 @@ static void PD_PHY_FlushTx(void)
 static void pd_defer_rx_packet(uint8_t rx_sop)
 {
     uint8_t tail;
+    uint32_t sequence;
 
     if (s_deferred_rx_count >= PD_RX_DEFER_QUEUE_LEN) {
         return;
     }
 
+    sequence = ++PD_PHY.RxSequence;
     tail = s_deferred_rx_tail;
     memcpy(s_deferred_rx_queue[tail], s_irq_rx_buf,
            sizeof(s_deferred_rx_queue[tail]));
     s_deferred_rx_sop[tail] = rx_sop;
+    s_deferred_rx_sequence[tail] = sequence;
+    s_deferred_rx_timestamp_ms[tail] = PD_PHY.TimeMs;
     s_deferred_rx_tail = (uint8_t)((tail + 1u) % PD_RX_DEFER_QUEUE_LEN);
     s_deferred_rx_count++;
     s_defer_rx_finish = 1;
@@ -792,6 +816,8 @@ void PD_PHY_FlushTxNow(void)
 
 void PD_PHY_TickMs(uint8_t delta_ms)
 {
+    PD_PHY.TimeMs += delta_ms;
+
     if (PD_PHY.WaitMsgTx && PD_PHY.MsgTxCnt > 0) {
         if (PD_PHY.MsgTxCnt <= delta_ms) {
             PD_PHY.MsgTxCnt = 0;
@@ -818,6 +844,7 @@ void PD_PHY_TickMs(uint8_t delta_ms)
     PD_Analyzer_Attach_Tick(delta_ms);
     PD_Analyzer_Srccap_Tick(delta_ms);
     PD_Source_VDM_Probe_Tick(delta_ms);
+    PD_Request_Arbiter_Tick(delta_ms);
 }
 
 static void PD_PHY_RunDeferredRx(void)
@@ -848,6 +875,9 @@ static void PD_PHY_RunDeferredRx(void)
         head = s_deferred_rx_head;
         rx_sop = s_deferred_rx_sop[head];
         memcpy(PD_RX_BUF, s_deferred_rx_queue[head], sizeof(PD_RX_BUF));
+        PD_PHY.LastRxSop = rx_sop;
+        PD_PHY.LastRxSequence = s_deferred_rx_sequence[head];
+        PD_PHY.LastRxTimestampMs = s_deferred_rx_timestamp_ms[head];
         s_deferred_rx_head = (uint8_t)((head + 1u) % PD_RX_DEFER_QUEUE_LEN);
         s_deferred_rx_count--;
         s_defer_rx_finish = (s_deferred_rx_count != 0u);
@@ -967,9 +997,11 @@ void PD_PHY_IRQHandler(void)
                             PD_Ack_Buf[0] = (uint8_t)(DEF_TYPE_GOODCRC |
                                                       (PD_Rx_Buf[0] & 0xC0u));
                             PD_Ack_Buf[1] = (PD_Rx_Buf[1] & 0x0Eu);
+                            /* Do not let a stale TX_END finish this new GoodCRC. */
+                            USBPD->STATUS = IF_TX_END;
                             USBPD->CONFIG |= IE_TX_END;
-                            PD_Phy_SendPack(0, PD_Ack_Buf, 2, UPD_SOP0);
                             s_waiting_gcrc_tx = 1;
+                            PD_Phy_SendPack(0, PD_Ack_Buf, 2, UPD_SOP0);
                         } else if (!pd_phy_auto_goodcrc(rx_sop)) {
                             NVIC_DisableIRQ(USBPD_IRQn);
                             pd_defer_rx_packet(rx_sop);
@@ -1014,14 +1046,15 @@ void PD_PHY_IRQHandler(void)
                 PD_PHY.LastRxSop = s_pending_rx_sop;
                 PD_Ack_Buf[0] = (uint8_t)(DEF_TYPE_GOODCRC | (pb[0] & 0xC0u));
                 PD_Ack_Buf[1] = (pb[1] & 0x0Eu);
+                USBPD->STATUS = IF_TX_END;
                 USBPD->CONFIG |= IE_TX_END;
                 if ((USBPD->CONFIG & CC_SEL) == CC_SEL) {
                     USBPD->PORT_CC2 |= CC_LVE;
                 } else {
                     USBPD->PORT_CC1 |= CC_LVE;
                 }
-                PD_Phy_SendPack(0, PD_Ack_Buf, 2, UPD_SOP0);
                 s_waiting_gcrc_tx = 1;
+                PD_Phy_SendPack(0, PD_Ack_Buf, 2, UPD_SOP0);
                 /* Leave IRQ disabled until this second GoodCRC completes. */
             } else {
                 /*
@@ -1046,14 +1079,15 @@ void PD_PHY_IRQHandler(void)
                         PD_Ack_Buf[0] = (uint8_t)(DEF_TYPE_GOODCRC |
                                                   (PD_Rx_Buf[0] & 0xC0u));
                         PD_Ack_Buf[1] = (PD_Rx_Buf[1] & 0x0Eu);
+                        USBPD->STATUS = IF_TX_END;
                         USBPD->CONFIG |= IE_TX_END;
                         if ((USBPD->CONFIG & CC_SEL) == CC_SEL) {
                             USBPD->PORT_CC2 |= CC_LVE;
                         } else {
                             USBPD->PORT_CC1 |= CC_LVE;
                         }
-                        PD_Phy_SendPack(0, PD_Ack_Buf, 2, UPD_SOP0);
                         s_waiting_gcrc_tx = 1;
+                        PD_Phy_SendPack(0, PD_Ack_Buf, 2, UPD_SOP0);
                         return;
                     }
                 }

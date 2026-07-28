@@ -36,7 +36,7 @@ hot-swapped sources into sessions and generate a stable summary:
 ```powershell
 python -m pip install -r tools/requirements.txt
 python tools/pd_capture.py --list
-python tools/pd_capture.py --port COM3 --label aohi-240w
+python tools/pd_capture.py --port COM3 --source-id aohi-240w --source-manufacturer AOHI --source-model AOC-C022 --cable-id cable-01 --cable-attachment detachable
 ```
 
 The default baud rate is 921600. The tool normally prints only completed or
@@ -45,7 +45,8 @@ is saved below `captures/` with the exact UART byte stream plus per-session
 artifacts:
 
 ```text
-captures/YYYYMMDD_HHMMSS_label/
+captures/YYYYMMDD_HHMMSS_SOURCE_MANUFACTURER_SOURCE_MODEL/
+  capture.json
   raw.bin
   raw.log
   events.jsonl
@@ -59,11 +60,33 @@ captures/YYYYMMDD_HHMMSS_label/
 Saved structured logs can be processed again without hardware using
 `python tools/pd_capture.py --replay path/to/raw.log`.
 
-Every capture stop also refreshes two aggregate capability tables:
+Every capture stop also refreshes the aggregate capability reports:
 
 - `captures/spec_table.html`: searchable source/cable/protocol table with links
   to each session's summary, JSON, and raw log
 - `captures/spec_table.csv`: the same rows for Excel or further processing
+- `captures/source_table.csv`: one consolidated capability row per source ID
+- `captures/pdo_table.csv`: one normalized row per advertised PDO, with raw
+  values and source-role flags aligned with ASD-PD31 field names
+- `captures/cable_table.csv`: one row per cable ID with decoded SOP' identity
+  and the sources on which that cable was observed
+
+`source_id` and `cable_id` identify independent devices. A session records the
+temporary source/cable pairing, while PDO rows belong to `source_id` and cable
+identity rows belong to `cable_id`. `--label` remains an alias for
+`--source-id`. The human-readable capture folder suffix is built from
+`--source-manufacturer` and `--source-model`; `source_id` remains the stable
+CSV/database key. For older captures without an explicit cable ID, the report uses
+an `auto-emarker-*` capability fingerprint derived from the captured VDOs; use
+`--cable-id` when individual physical cables must remain distinguishable.
+
+Use `--cable-attachment captive` for a source with a permanently attached
+cable. The source and SOP' identity remain separate records, but
+`source_table.csv` links the source to `captive_cable_id`, and
+`cable_table.csv` links the cable back to `owner_source_id`. If `--cable-id`
+is omitted for a captive cable, the capture tool derives
+`source-id:captive`. Detachable observations remain temporary pairings and do
+not create an ownership relationship.
 
 Open `captures/spec_table.html` in a browser to compare adapters without
 opening the individual session files. Existing captures can be re-indexed at

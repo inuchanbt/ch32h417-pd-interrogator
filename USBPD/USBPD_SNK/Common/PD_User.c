@@ -34,7 +34,8 @@ vu8 SrcCapCnt = 1;
  *   bit[23]=EPRCap=1 (EPR エントリ条件)
  * PDO[2]: EPR AVS Sink APDO 15000-48000mV PDP=240W
  *   ソースへ EPR 全範囲対応を通知するための宣言。
- *   実際の高電圧 Request は送らず EPR Mode Exit で即時復帰する。
+ *   EPR_Source_Capabilities 取得後は現在の 5V PDO を EPR_Request で
+ *   再要求し、高電圧へ遷移せずに EPR 契約を成立させてから Exit する。
  */
 u32 SinkCap[] = {
     0x2B8641F4,   /* Fixed 20V/5A: EPRCap=1(b23) UnchunkExt=1(b24) HigherCap=1(b27) DRP=1(b29) */

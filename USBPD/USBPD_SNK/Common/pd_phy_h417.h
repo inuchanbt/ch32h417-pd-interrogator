@@ -93,6 +93,12 @@ typedef struct {
     uint8_t  RxSop;
     uint8_t  LastRxSop;
     uint8_t  TxSop;
+    uint32_t TimeMs;
+    uint32_t RxSequence;
+    uint32_t LastRxSequence;
+    uint32_t LastRxTimestampMs;
+    uint32_t TxStartRxSequence;
+    uint32_t TxStartTimestampMs;
     uint8_t  TxMsgID;
     uint8_t  RxMsgID;
     uint8_t  RetryCnt;

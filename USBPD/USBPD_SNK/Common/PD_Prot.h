@@ -41,6 +41,7 @@ void pProt_RX_SrcCap(void);
 void pProt_TX_Request(void);
 void pProt_RX_Accept(void);
 void pProt_RX_PS_RDY(void);
+void PD_Request_Arbiter_Tick(u8 delta_ms);
 
 void pProt_TX_SinkCap(void);
 void pProt_RX_DRSwap(void);
