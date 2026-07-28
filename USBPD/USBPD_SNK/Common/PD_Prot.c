@@ -66,7 +66,6 @@ static u8 PD_Request_Fail_Count = 0;
 static u8 PD_Request_Stop_After_Fail = 0;
 static u8 PD_Request_Async_Rx_Count = 0;
 static u16 PD_PostExit_Request_DelayMs = 0;
-static u8 PD_Deferred_Request_Action = 0;
 static u16 PD_Suppressed_SrcCap_Count = 0;
 static u32 PD_Current_SrcCap_Fingerprint = 0;
 static u32 PD_Failed_SrcCap_Fingerprint = 0;
@@ -83,14 +82,6 @@ static u32 PD_EPR_Attempted_FP = 0;  /* EPR を試みた PDO セットのフィ�
 static u8 PD_Failed_SrcCap_NDO = 0;
 static u32 PD_Request_SrcCap_Fingerprint = 0;
 static u8 PD_Request_SrcCap_NDO = 0;
-
-#define PD_DELL_LA280PM240_SRC_CAP_FP 0x985E5B15u
-
-enum {
-	PD_DEFERRED_ACTION_NONE = 0,
-	PD_DEFERRED_ACTION_REQUEST,
-	PD_DEFERRED_ACTION_SOFT_RESET
-};
 
 /*
  * Source_Cap の情報を契約確立まで遅延表示するための一時保存変数。
@@ -588,12 +579,9 @@ static void pProt_PS_RDY_Failed(void);
 
 void PD_Request_Arbiter_Tick(u8 delta_ms)
 {
-	u8 action;
-
 	if ( PD_PostExit_Request_DelayMs == 0u ) return;
 	if ( !PD_DEVICE.ConnectStat ) {
 		PD_PostExit_Request_DelayMs = 0u;
-		PD_Deferred_Request_Action = PD_DEFERRED_ACTION_NONE;
 		return;
 	}
 	if ( PD_PostExit_Request_DelayMs > delta_ms ) {
@@ -613,15 +601,7 @@ void PD_Request_Arbiter_Tick(u8 delta_ms)
 		return;
 	}
 
-	action = PD_Deferred_Request_Action;
 	PD_PostExit_Request_DelayMs = 0u;
-	PD_Deferred_Request_Action = PD_DEFERRED_ACTION_NONE;
-	if ( action == PD_DEFERRED_ACTION_SOFT_RESET ) {
-		printf("Dell discovery guard complete; TX Soft_Reset instead of "
-		       "timing out to Hard Reset\r\n");
-		pProt_TX_SoftRst();
-		return;
-	}
 	printf("Source AMS guard complete; TX Request Fixed PDO1\r\n");
 	pProt_TX_Request();
 }
@@ -1565,7 +1545,6 @@ static void PD_EPR_Exit_RX(void)
 				VDM_State.Explicit_Contract_Established = 0;
 				PD_PHY.WaitMsgRx = 0u;
 				PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
-				PD_Deferred_Request_Action = PD_DEFERRED_ACTION_REQUEST;
 				PD_PostExit_Request_DelayMs = 15u;
 				return;
 			}
@@ -2829,7 +2808,6 @@ void pDevice_Attached(void)
 	PD_Request_Stop_After_Fail  = 0;
 	PD_Request_Fail_Count       = 0;
 	PD_PostExit_Request_DelayMs = 0;
-	PD_Deferred_Request_Action  = PD_DEFERRED_ACTION_NONE;
 	PD_Suppressed_SrcCap_Count  = 0;
 	PD_Stored_SrcCap_NDO        = 0;
 	PD_InfoProbe_Skip_Mask      = 0;
@@ -2875,7 +2853,6 @@ void pDevice_Unattached(void)
 	PD_InfoProbe_NoResponseCnt = 0;
 	PD_InfoProbe_Done = 0;
 	PD_PostExit_Request_DelayMs = 0;
-	PD_Deferred_Request_Action = PD_DEFERRED_ACTION_NONE;
 	PD_EPR_Probe_Done = 0;
 	PD_PPS_Probe_Done = 0;
 	PD_InfoProbe_SoftRst_Recovery_5V_Cnt = 0;
@@ -2910,7 +2887,6 @@ void pProt_IDLE(void)
 		     vdm->SVID == 0xFF00u ) {
 			printf("RX Discover SVIDs during Request guard; "
 			       "hardware GoodCRC only\r\n");
-			PD_Deferred_Request_Action = PD_DEFERRED_ACTION_REQUEST;
 			PD_PostExit_Request_DelayMs = 15u;
 			PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 			return;
@@ -3250,7 +3226,6 @@ void pProt_RX_SrcCap(void)
 				 * source's approximately 30 ms transition deadline.
 			 */
 			VDM_State.Explicit_Contract_Established = 0;
-			PD_Deferred_Request_Action = PD_DEFERRED_ACTION_REQUEST;
 			PD_PostExit_Request_DelayMs = 15u;
 				PD_PHY.WaitMsgRx = 0u;
 				PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
@@ -3402,23 +3377,6 @@ static void pProt_Request_Rearm_After_Async(u8 waiting_ps_rdy)
 	} else if ( is_vdm ) {
 		printf("Quarantine asynchronous VDM during Request %s wait; "
 		       "hardware GoodCRC only\r\n", phase);
-	}
-
-	/*
-	 * LA280PM240 never sends PS_RDY after this source-initiated discovery.
-	 * Waiting eventually makes the sink issue Hard Reset, after which Dell
-	 * removes Object 5 from EPR Source Capabilities.  The captured sequence
-	 * that retained Object 5 used a sink Soft Reset about 6.6 ms after Accept.
-	 */
-	if ( waiting_ps_rdy && is_discover_svid &&
-	     PD_Current_SrcCap_Fingerprint == PD_DELL_LA280PM240_SRC_CAP_FP ) {
-		printf("Dell LA280PM240 discovery interrupted PS_RDY; "
-		       "schedule Soft_Reset recovery in 6ms\r\n");
-		PD_PHY.WaitMsgRx = 0u;
-		PD_Prot_pSet(NULL, pProt_IDLE, NULL, NULL);
-		PD_Deferred_Request_Action = PD_DEFERRED_ACTION_SOFT_RESET;
-		PD_PostExit_Request_DelayMs = 6u;
-		return;
 	}
 
 	if ( PD_Request_Async_Rx_Count > PD_REQUEST_ASYNC_RX_MAX ) {
@@ -3667,7 +3625,6 @@ void pProt_TX_SoftRst(void)
 {
 	DEBUG_Print("TX SoftRST\r\n");
 	PD_PostExit_Request_DelayMs = 0;
-	PD_Deferred_Request_Action = PD_DEFERRED_ACTION_NONE;
 	PD_PHY.TxMsgID = PD_PHY.RxMsgID = 0;
 	VDM_State.Explicit_Contract_Established = 0;
 	VDM_State.Enter_Mode_already = 0;
@@ -3708,7 +3665,6 @@ void pProt_RX_SoftRst(void)
 {
 	DEBUG_Print("Rx SoftRST\r\n");
 	PD_PostExit_Request_DelayMs = 0;
-	PD_Deferred_Request_Action = PD_DEFERRED_ACTION_NONE;
 	/*
 	 * Cancel the interrupted AMS before preparing Accept.  In particular,
 	 * prevent a queued GET_* or chunk request from being emitted after the
