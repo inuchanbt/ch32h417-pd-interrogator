@@ -148,6 +148,7 @@ typedef struct {
 	u8  cc;
 	u8  spr_pdo_count;
 	u8  pps_count;
+	u8  spr_avs_count;
 	u8  epr_capable;
 	u32 spr_max_mw;
 	u32 spr_pdo[7];
@@ -188,6 +189,10 @@ typedef struct {
 static st_PD_Result s_pd_result;
 static u16 s_pd_result_session_seq;
 static volatile u16 s_pd_result_dirty;
+static u8 s_pd_result_protocol_critical;
+static u8 s_epr_print_pending;
+
+static void PD_EPR_Print_Reconstructed(void);
 
 static const char *PD_Result_Status_Name(u8 status)
 {
@@ -287,9 +292,10 @@ static void PD_Result_Emit(u16 dirty, u8 final)
 		       (unsigned)s_pd_result.session, (unsigned)s_pd_result.cc);
 	}
 	if ( dirty & PD_RESULT_DIRTY_SPR ) {
-		printf("@PD1,type=spr,session=%u,pdo_count=%u,pps_count=%u,max_mw=%lu,epr_capable=%u\r\n",
+		printf("@PD1,type=spr,session=%u,pdo_count=%u,pps_count=%u,spr_avs_count=%u,max_mw=%lu,epr_capable=%u\r\n",
 		       (unsigned)s_pd_result.session, (unsigned)s_pd_result.spr_pdo_count,
-		       (unsigned)s_pd_result.pps_count, (unsigned long)s_pd_result.spr_max_mw,
+		       (unsigned)s_pd_result.pps_count, (unsigned)s_pd_result.spr_avs_count,
+		       (unsigned long)s_pd_result.spr_max_mw,
 		       (unsigned)s_pd_result.epr_capable);
 		for ( i = 0u; i < s_pd_result.spr_pdo_count && i < 7u; i++ ) {
 			printf("@PD1,type=spr_pdo,session=%u,index=%u,raw=%08lX\r\n",
@@ -390,6 +396,8 @@ void PD_Result_OnAttach(void)
 	s_pd_result.pps_probe_status = PD_RESULT_STATUS_NA;
 	s_pd_result.epr_enter_status = PD_RESULT_STATUS_NA;
 	s_pd_result.chunk_status = PD_RESULT_STATUS_NA;
+	s_pd_result_protocol_critical = 0u;
+	s_epr_print_pending = 0u;
 	s_pd_result_dirty = PD_RESULT_DIRTY_ATTACH | PD_RESULT_DIRTY_PROTOCOL;
 	/* The source can query SOP' before the sink attach state is entered. */
 	if ( cable_status == PD_RESULT_STATUS_PASS ) {
@@ -417,22 +425,40 @@ void PD_Result_SetCC(u8 cc)
 void PD_Result_OnDetach(void)
 {
 	if ( !s_pd_result.active ) return;
+	if ( s_epr_print_pending ) {
+		PD_EPR_Print_Reconstructed();
+		printf("EPR_Source_Capabilities: %s\r\n",
+		       s_pd_result.epr_complete ? "complete" : "partial");
+		s_epr_print_pending = 0u;
+	}
 	PD_Result_Emit(PD_RESULT_DIRTY_ATTACH | PD_RESULT_DIRTY_SPR |
 	               PD_RESULT_DIRTY_EPR | PD_RESULT_DIRTY_IDENTITY |
 	               PD_RESULT_DIRTY_CABLE | PD_RESULT_DIRTY_PROTOCOL, 1u);
 	printf("@PD1,type=detach,session=%u\r\n", (unsigned)s_pd_result.session);
 	memset(&s_pd_result, 0, sizeof(s_pd_result));
 	s_pd_result_dirty = 0u;
+	s_pd_result_protocol_critical = 0u;
+	s_epr_print_pending = 0u;
 }
 
 void PD_Result_Poll(void)
 {
 	u16 dirty;
-	if ( !s_pd_result.active || s_pd_result_dirty == 0u ) return;
+	if ( !s_pd_result.active ||
+	     (s_pd_result_dirty == 0u && !s_epr_print_pending) ) return;
 	if ( PD_PHY.WaitMsgTx || PD_PHY.WaitMsgRx || (USBPD->CONTROL & PD_TX_EN) ) return;
+	/* Synchronous UART output must not consume an EPR/Request response window. */
+	if ( s_pd_result_protocol_critical || PD_PostExit_Request_DelayMs ||
+	     PD_Dell_PreEPR_SettleActive ) return;
+	if ( s_epr_print_pending ) {
+		PD_EPR_Print_Reconstructed();
+		printf("EPR_Source_Capabilities: %s\r\n",
+		       s_pd_result.epr_complete ? "complete" : "partial");
+		s_epr_print_pending = 0u;
+	}
 	dirty = s_pd_result_dirty;
 	s_pd_result_dirty = 0u;
-	PD_Result_Emit(dirty, 0u);
+	if ( dirty ) PD_Result_Emit(dirty, 0u);
 }
 
 static void PD_Result_UpdateSPR(const u32 *pdo, u8 count)
@@ -442,6 +468,7 @@ static void PD_Result_UpdateSPR(const u32 *pdo, u8 count)
 	if ( count > 7u ) count = 7u;
 	s_pd_result.spr_pdo_count = count;
 	s_pd_result.pps_count = 0u;
+	s_pd_result.spr_avs_count = 0u;
 	s_pd_result.epr_capable = 0u;
 	memset(s_pd_result.spr_pdo, 0, sizeof(s_pd_result.spr_pdo));
 	for ( i = 0u; i < count; i++ ) {
@@ -460,11 +487,21 @@ static void PD_Result_UpdateSPR(const u32 *pdo, u8 count)
 			u32 mv = ((raw >> 20) & 0x3FFu) * 50u;
 			u32 ma = (raw & 0x3FFu) * 10u;
 			mw = mv * ma / 1000u;
-		} else if ( ((raw >> 28) & 0x03u) == 0u ) {
-			u32 mv = ((raw >> 17) & 0xFFu) * 100u;
-			u32 ma = (raw & 0x7Fu) * 50u;
-			s_pd_result.pps_count++;
-			mw = mv * ma / 1000u;
+		} else {
+			u8 apdo_type = (u8)((raw >> 28) & 0x03u);
+			if ( apdo_type == 0u ) {
+				u32 mv = ((raw >> 17) & 0xFFu) * 100u;
+				u32 ma = (raw & 0x7Fu) * 50u;
+				s_pd_result.pps_count++;
+				mw = mv * ma / 1000u;
+			} else if ( apdo_type == 2u ) {
+				u32 ma_15v = ((raw >> 10) & 0x3FFu) * 10u;
+				u32 ma_20v = (raw & 0x3FFu) * 10u;
+				u32 mw_15v = 15000u * ma_15v / 1000u;
+				u32 mw_20v = 20000u * ma_20v / 1000u;
+				s_pd_result.spr_avs_count++;
+				mw = (mw_20v > mw_15v) ? mw_20v : mw_15v;
+			}
 		}
 		if ( mw > max_mw ) max_mw = mw;
 	}
@@ -505,8 +542,7 @@ static void PD_Result_UpdateEPR(const u32 *pdo, u8 count, u8 complete)
 				u8 n = s_pd_result.epr_fixed_count++;
 				s_pd_result.epr_fixed_mv[n] = (u16)(((raw >> 10) & 0x3FFu) * 50u);
 				s_pd_result.epr_fixed_ma[n] = (u16)((raw & 0x3FFu) * 10u);
-			} else if ( type == 3u && (((raw >> 28) & 0x03u) == 1u ||
-			                              ((raw >> 28) & 0x03u) == 2u) ) {
+			} else if ( type == 3u && ((raw >> 28) & 0x03u) == 1u ) {
 				s_pd_result.avs_min_mv = (u16)(((raw >> 8) & 0x1FFu) * 100u);
 				s_pd_result.avs_max_mv = (u16)(((raw >> 17) & 0x1FFu) * 100u);
 				s_pd_result.avs_pdp_w = (u8)(raw & 0xFFu);
@@ -515,6 +551,7 @@ static void PD_Result_UpdateEPR(const u32 *pdo, u8 count, u8 complete)
 	}
 	s_pd_result.epr_enter_status = complete ? PD_RESULT_STATUS_PASS : s_pd_result.epr_enter_status;
 	s_pd_result.chunk_status = complete ? PD_RESULT_STATUS_PASS : PD_RESULT_STATUS_FAIL;
+	if ( count ) s_epr_print_pending = 1u;
 	s_pd_result_dirty |= PD_RESULT_DIRTY_EPR | PD_RESULT_DIRTY_PROTOCOL;
 }
 
@@ -658,9 +695,9 @@ static void PD_Print_PDO_Content_Compact(u32 pdo)
 		u16 mv = (u16)(((pdo >> 10) & 0x3FFu) * 50u);
 		u16 ma = (u16)((pdo & 0x3FFu) * 10u);
 		u32 mw = (u32)mv * ma / 1000u;
-		printf("Fixed %u.%uV/%u.%uA (%uW)",
+		printf("Fixed %u.%uV @ %u.%02uA (%uW)",
 		       (unsigned)(mv/1000u), (unsigned)((mv%1000u)/100u),
-		       (unsigned)(ma/1000u), (unsigned)((ma%1000u)/100u),
+		       (unsigned)(ma/1000u), (unsigned)((ma%1000u)/10u),
 		       (unsigned)(mw/1000u));
 		if ( (pdo >> 23u) & 1u ) printf(" EPRCap");
 	} else if ( type == 1u ) {
@@ -675,31 +712,44 @@ static void PD_Print_PDO_Content_Compact(u32 pdo)
 		u16 max_mv = (u16)(((pdo >> 20) & 0x3FFu) * 50u);
 		u16 min_mv = (u16)(((pdo >> 10) & 0x3FFu) * 50u);
 		u16 ma     = (u16)((pdo & 0x3FFu) * 10u);
-		printf("Variable %u.%uV-%u.%uV/%u.%uA",
+		printf("Variable %u.%u-%u.%uV @ %u.%02uA",
 		       (unsigned)(min_mv/1000u), (unsigned)((min_mv%1000u)/100u),
 		       (unsigned)(max_mv/1000u), (unsigned)((max_mv%1000u)/100u),
-		       (unsigned)(ma/1000u),     (unsigned)((ma%1000u)/100u));
+		       (unsigned)(ma/1000u),     (unsigned)((ma%1000u)/10u));
 	} else {
 		u8 apdo_type = (u8)((pdo >> 28) & 0x03u);
 		if ( apdo_type == 0u ) {
 			u16 max_mv = (u16)(((pdo >> 17) & 0xFFu)  * 100u);
 			u16 min_mv = (u16)(((pdo >> 8)  & 0xFFu)  * 100u);
 			u16 ma     = (u16)((pdo & 0x7Fu) * 50u);
-			printf("PPS %u.%uV-%u.%uV/%u.%uA",
+			printf("PPS %u.%u-%u.%uV @ %u.%02uA",
 			       (unsigned)(min_mv/1000u), (unsigned)((min_mv%1000u)/100u),
 			       (unsigned)(max_mv/1000u), (unsigned)((max_mv%1000u)/100u),
-			       (unsigned)(ma/1000u),     (unsigned)((ma%1000u)/100u));
-		} else if ( apdo_type == 1u || apdo_type == 2u ) {
-			/* PD 3.2 Table 6-81: MaxVoltage = bits[25:17] (9 bits, 100mV)
+			       (unsigned)(ma/1000u),     (unsigned)((ma%1000u)/10u));
+		} else if ( apdo_type == 1u ) {
+			/* EPR AVS Source APDO: MaxVoltage = bits[25:17] (9 bits, 100mV)
 			 * bit27 is Peak Overcurrent Support, bit26 is reserved/vendor flag.
 			 * Mask must be 0x1FF, not 0x7FF, or AOHI-style PDOs with bit26=1 overflow u16. */
 			u16 max_mv = (u16)(((pdo >> 17) & 0x1FFu) * 100u);
 			u16 min_mv = (u16)(((pdo >> 8)  & 0x1FFu) * 100u);
 			u8  pdp_w  = (u8)(pdo & 0xFFu);
-			printf("EPR AVS %u.%uV-%u.%uV PDP=%uW",
+			printf("AVS %u.%u-%u.%uV PDP=%uW",
 			       (unsigned)(min_mv/1000u), (unsigned)((min_mv%1000u)/100u),
 			       (unsigned)(max_mv/1000u), (unsigned)((max_mv%1000u)/100u),
 			       (unsigned)pdp_w);
+		} else if ( apdo_type == 2u ) {
+			u16 ma_15v = (u16)(((pdo >> 10) & 0x3FFu) * 10u);
+			u16 ma_20v = (u16)((pdo & 0x3FFu) * 10u);
+			printf("AVS 9.0-%sV (9.0-15.0V @ %u.%02uA",
+			       ma_20v ? "20.0" : "15.0",
+			       (unsigned)(ma_15v / 1000u),
+			       (unsigned)((ma_15v % 1000u) / 10u));
+			if ( ma_20v ) {
+				printf(" / 15.0-20.0V @ %u.%02uA",
+				       (unsigned)(ma_20v / 1000u),
+				       (unsigned)((ma_20v % 1000u) / 10u));
+			}
+			printf(")");
 		} else {
 			printf("APDO type:3 raw:0x%08lX", (unsigned long)pdo);
 		}
@@ -715,7 +765,7 @@ static void PD_Print_PDO(u8 index, u32 pdo)
 		u16 mv = (u16)(((pdo >> 10) & 0x3FF) * 50);
 		u16 ma = (u16)((pdo & 0x3FF) * 10);
 		u32 mw = ((u32)mv * ma) / 1000;
-		printf("Fixed %umV %umA %lumW", mv, ma, (unsigned long)mw);
+		printf("Fixed %umV @ %umA %lumW", mv, ma, (unsigned long)mw);
 		printf(" flags: DRP=%d Suspend=%d Unconstr=%d USBComm=%d DRD=%d UnchunkExt=%d EPRCap=%d Peak=%lu",
 			(int)((pdo >> 29) & 1), (int)((pdo >> 28) & 1), (int)((pdo >> 27) & 1),
 			(int)((pdo >> 26) & 1), (int)((pdo >> 25) & 1), (int)((pdo >> 24) & 1),
@@ -731,7 +781,7 @@ static void PD_Print_PDO(u8 index, u32 pdo)
 		u16 max_mv = (u16)(((pdo >> 20) & 0x3FF) * 50);
 		u16 min_mv = (u16)(((pdo >> 10) & 0x3FF) * 50);
 		u16 ma = (u16)((pdo & 0x3FF) * 10);
-		printf("Variable %u-%umV %umA", min_mv, max_mv, ma);
+		printf("Variable %u-%umV @ %umA", min_mv, max_mv, ma);
 	}
 	else {
 		u8 apdo_type = (u8)((pdo >> 28) & 0x03);
@@ -739,9 +789,9 @@ static void PD_Print_PDO(u8 index, u32 pdo)
 			u16 max_mv = (u16)(((pdo >> 17) & 0xFF) * 100);
 			u16 min_mv = (u16)(((pdo >> 8) & 0xFF) * 100);
 			u16 ma = (u16)((pdo & 0x7F) * 50);
-			printf("SPR PPS APDO %u-%umV %umA powerLimited=%d", min_mv, max_mv, ma, (int)((pdo >> 27) & 1));
+			printf("SPR PPS APDO %u-%umV @ %umA powerLimited=%d", min_mv, max_mv, ma, (int)((pdo >> 27) & 1));
 		}
-		else if ( apdo_type == 1 || apdo_type == 2 ) {
+		else if ( apdo_type == 1 ) {
 			/* bits[25:17]=MaxVoltage (9-bit, 100mV); bits[27:26]=flags (not voltage) */
 			u16 max_mv = (u16)(((pdo >> 17) & 0x1FF) * 100);
 			u16 min_mv = (u16)(((pdo >> 8)  & 0x1FF) * 100);
@@ -757,12 +807,21 @@ static void PD_Print_PDO(u8 index, u32 pdo)
 				u32  f_mw  = (u32)f_mv * f_ma / 1000;
 				if ( f_mv >= 4750 && f_mv <= 50000 && f_ma > 0 ) {
 					printf(" (WARN: non-compliant as EPR AVS;"
-					       " may be Fixed %umV %umA %lumW with wrong type-bits)",
+					       " may be Fixed %umV @ %umA %lumW with wrong type-bits)",
 					       f_mv, f_ma, f_mw);
 				} else {
 					printf(" (WARN: voltage fields appear non-compliant)");
 				}
+				}
 			}
+		else if ( apdo_type == 2 ) {
+			u16 ma_15v = (u16)(((pdo >> 10) & 0x3FFu) * 10u);
+			u16 ma_20v = (u16)((pdo & 0x3FFu) * 10u);
+			u8 peak = (u8)((pdo >> 26) & 0x03u);
+			printf("SPR AVS APDO 9000-%umV (9000-15000mV @ %umA",
+			       ma_20v ? 20000u : 15000u, ma_15v);
+			if ( ma_20v ) printf(" / 15000-20000mV @ %umA", ma_20v);
+			printf(") peak=%u", (unsigned)peak);
 		}
 		else {
 			printf("Augmented APDO type:%d (reserved/unknown)", apdo_type);
@@ -806,6 +865,12 @@ static void __attribute__((unused)) PD_Print_Source_Capabilities(void)
 				u32 max_mv = ((pdo >> 17) & 0xFF) * 100;
 				u32 ma = (pdo & 0x7F) * 50;
 				mw = (max_mv * ma) / 1000;
+			} else if ( ((pdo >> 28) & 0x03) == 2 ) {
+				u32 ma_15v = ((pdo >> 10) & 0x3FFu) * 10u;
+				u32 ma_20v = (pdo & 0x3FFu) * 10u;
+				u32 mw_15v = 15000u * ma_15v / 1000u;
+				u32 mw_20v = 20000u * ma_20v / 1000u;
+				mw = (mw_20v > mw_15v) ? mw_20v : mw_15v;
 			}
 		}
 		if ( mw > max_mw ) {
@@ -857,6 +922,12 @@ static void PD_Print_Source_Capabilities_Deferred(void)
 				u32 max_mv = ((pdo >> 17) & 0xFF) * 100;
 				u32 ma = (pdo & 0x7F) * 50;
 				mw = (max_mv * ma) / 1000;
+			} else if ( ((pdo >> 28) & 0x03) == 2 ) {
+				u32 ma_15v = ((pdo >> 10) & 0x3FFu) * 10u;
+				u32 ma_20v = (pdo & 0x3FFu) * 10u;
+				u32 mw_15v = 15000u * ma_15v / 1000u;
+				u32 mw_20v = 20000u * ma_20v / 1000u;
+				mw = (mw_20v > mw_15v) ? mw_20v : mw_15v;
 			}
 		}
 		if ( mw > max_mw ) { max_mw = mw; max_index = i + 1; }
@@ -1503,6 +1574,7 @@ static void PD_EPR_Exit_NoResponse(void)
 {
 	PD_PHY.WaitMsgRx = 0;
 	s_epr_exit_async_rx_count = 0;
+	s_pd_result_protocol_critical = 0u;
 	s_pd_result.epr_exit_status = PD_RESULT_EXIT_TIMEOUT;
 	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	printf("\r\nEPR Mode Exit: no response; assuming returned to SPR\r\n");
@@ -1524,6 +1596,7 @@ static void PD_EPR_Exit_RX(void)
 
 		if ( action == 5 ) {  /* Exit Acknowledged — PD 3.1 Table 6-38 */
 			s_pd_result.epr_exit_status = PD_RESULT_EXIT_ACK;
+			s_pd_result_protocol_critical = 0u;
 			printf("EPR Mode: Exit Acknowledged — back to SPR\r\n");
 		} else {
 			s_pd_result.epr_exit_status = PD_RESULT_EXIT_UNEXPECTED;
@@ -1533,6 +1606,7 @@ static void PD_EPR_Exit_RX(void)
 		if ( !rxHeader->Extended && rxHeader->NDO == 0 &&
 		     rxHeader->MsgType == PD_Ctrl_SoftReset ) {
 			s_pd_result.epr_exit_status = PD_RESULT_EXIT_SOFT_RESET;
+			s_pd_result_protocol_critical = 0u;
 			printf("EPR Mode Exit: Source issued Soft_Reset; treating as returned to SPR\r\n");
 			/* SoftReset に正しく応答する — pProt_RX_SoftRst は後続の
 			 * pProt_IDLE 設定で上書きされるため、ここでは単純に SPR 復帰とみなす。 */
@@ -1598,6 +1672,7 @@ static void PD_EPR_Exit_RX(void)
 		}
 	}
 	s_epr_exit_async_rx_count = 0;
+	s_pd_result_protocol_critical = 0u;
 	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 	PD_Source_VDM_Probe_Arm_Delayed(250);
@@ -1643,7 +1718,7 @@ static void PD_EPR_Request_PS_RDY_RX(void)
 			s_pd_result.pps_probe_status = PD_RESULT_STATUS_PASS;
 			s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 			printf("\r\nRX Accept + PS_RDY: EPR Object 5 PPS contract active "
-			       "(%umV/%umA)\r\n",
+			       "(%umV @ %umA)\r\n",
 			       (unsigned)s_epr_pps_req_mv,
 			       (unsigned)PD_ANALYZER_EPR_PPS_CURRENT_MA);
 
@@ -1660,8 +1735,6 @@ static void PD_EPR_Request_PS_RDY_RX(void)
 			return;
 		}
 		printf("\r\nRX Accept + PS_RDY: 5V EPR contract established\r\n");
-		PD_EPR_Print_Reconstructed();
-		printf("EPR_Source_Capabilities: complete\r\n");
 		PD_EPR_Exit();
 		return;
 	}
@@ -1751,8 +1824,8 @@ static void PD_EPR_SendRequest(void)
 				s_epr_pps_req_mv = req_mv;
 				s_pd_result.pps_probe_status = PD_RESULT_STATUS_PENDING;
 				s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
-				printf("EPR Object 5 is PPS %u-%umV/%umA; probing at "
-				       "%umV/%umA\r\n",
+				printf("EPR Object 5 is PPS %u-%umV @ %umA; probing at "
+				       "%umV @ %umA\r\n",
 				       (unsigned)min_mv, (unsigned)max_mv,
 				       (unsigned)max_ma, (unsigned)req_mv,
 				       (unsigned)req_ma);
@@ -1783,6 +1856,7 @@ static void PD_EPR_SendRequest(void)
 static void PD_EPR_Reassembly_Reset(void)
 {
 	u8 i;
+	s_epr_print_pending = 0u;
 	s_epr_total_size = 0u;
 	s_epr_softreset_wait_cnt = 0u;
 	s_epr_obj7_partial[0] = 0u;
@@ -1835,9 +1909,8 @@ static void PD_EPR_SrcCap_Timeout(void)
 	s_pd_result.chunk_status = PD_RESULT_STATUS_FAIL;
 	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	if ( s_epr_total_size > 0u ) {
-		/* chunk 0 は受信済み — 部分データを表示 */
-		printf("\r\nEPR_Source_Capabilities: chunk 1 timeout — partial data (chunk 0 only):\r\n");
-		PD_EPR_Print_Reconstructed();
+		/* chunk 0 は受信済み。PDO表はExit処理後の安全な時点で表示する。 */
+		printf("\r\nEPR_Source_Capabilities: chunk 1 timeout — partial data queued\r\n");
 		partial_count = (s_epr_total_size < 24u) ? (u8)(s_epr_total_size / 4u) : 6u;
 		PD_Result_UpdateEPR(s_epr_pdo_buf, partial_count, 0u);
 	} else {
@@ -1978,12 +2051,14 @@ static void PD_EPR_SrcCap_RX(void)
 		} else if ( action == 4 ) {
 			s_pd_result.epr_enter_status = PD_RESULT_STATUS_FAIL;
 			s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
+			s_pd_result_protocol_critical = 0u;
 			printf("EPR Mode: Enter Failed (action=4, data=0x%02X); no EPR_Source_Capabilities\r\n",
 			       (unsigned)((do0 >> 16) & 0xFFu));
 			PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 		} else {
 			s_pd_result.epr_enter_status = PD_RESULT_STATUS_FAIL;
 			s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
+			s_pd_result_protocol_critical = 0u;
 			printf("EPR Mode: Enter rejected — EPR_Mode action=0x%02X do0=0x%08lX; no EPR_Source_Capabilities\r\n",
 			       (unsigned)action, (unsigned long)do0);
 			PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
@@ -2036,6 +2111,7 @@ static void PD_EPR_SrcCap_RX(void)
 static void PD_EPR_Mode_NoResponse(void)
 {
 	PD_PHY.WaitMsgRx = 0;
+	s_pd_result_protocol_critical = 0u;
 	s_pd_result.epr_enter_status = PD_RESULT_STATUS_NO_RESPONSE;
 	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
 	printf("\r\nEPR Mode Enter: no response (source timed out)\r\n");
@@ -2046,6 +2122,7 @@ static void PD_EPR_Mode_NoResponse(void)
 static void PD_EPR_Mode_TxFailed(void)
 {
 	PD_PHY.WaitMsgRx = 0;
+	s_pd_result_protocol_critical = 0u;
 	PD_PHY_Abort();
 	s_pd_result.epr_enter_status = PD_RESULT_STATUS_TX_FAILED;
 	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
@@ -2089,9 +2166,11 @@ static void PD_EPR_Mode_Enter_RX(void)
 		} else if ( action == 4 ) {
 			s_pd_result.epr_enter_status = PD_RESULT_STATUS_FAIL;
 			s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
+			s_pd_result_protocol_critical = 0u;
 			printf("\r\nEPR Mode: Enter Failed (action=4, data=0x%02X)\r\n",
 			       (unsigned)((do0 >> 16) & 0xFFu));
 		} else {
+			s_pd_result_protocol_critical = 0u;
 			printf("\r\nEPR Mode Enter: EPR_Mode action=0x%02X do0=0x%08lX\r\n",
 			       (unsigned)action, (unsigned long)do0);
 		}
@@ -2224,7 +2303,7 @@ static void PD_PPS_RxStatus(void)
 		u8  *p     = ((u8 *)PD_RX_BUF) + 4;
 		u16 out_mv = (u16)((p[0] | ((u16)p[1] << 8)) * 20);
 		u16 out_ma = (u16)(p[2] * 50);
-		printf("PPS Status (after PPS contract %umV): output=%umV/%umA flags=0x%02X\r\n",
+		printf("PPS Status (after PPS contract %umV): output=%umV @ %umA flags=0x%02X\r\n",
 		       (unsigned)s_pps_req_mv, (unsigned)out_mv, (unsigned)out_ma, (unsigned)p[3]);
 		s_pd_result.pps_probe_status = PD_RESULT_STATUS_PASS;
 	} else if ( !rxHeader->Extended && rxHeader->NDO == 0 && rxHeader->MsgType == PD_Ctrl_NotSupported ) {
@@ -2246,7 +2325,7 @@ static void PD_PPS_RxPS_RDY(void)
 {
 	PD_PHY.WaitMsgRx = 0;
 	if ( !rxHeader->Extended && rxHeader->NDO == 0 && rxHeader->MsgType == PD_Ctrl_PS_Ready ) {
-		printf("\r\nRX PS_RDY: PPS contract (%umV/500mA) active\r\n", (unsigned)s_pps_req_mv);
+		printf("\r\nRX PS_RDY: PPS contract (%umV @ 500mA) active\r\n", (unsigned)s_pps_req_mv);
 		printf("TX probe: Get_PPS_Status\r\n");
 		PD_PHY_Header_Init( 1 , 0 , PD_Ctrl_GetPPSStatus );
 		PD_PHY.WaitMsgRx = 1;
@@ -2352,7 +2431,7 @@ static u8 __attribute__((unused)) PD_PPS_Probe_TryStart(void)
 	rdo |= ((u32)(req_mv / 20u) << 9);      /* Output Voltage (20mV units) */
 	rdo |= req_a;                            /* Operating Current (50mA units) */
 
-	printf("TX Request PPS (PDO Index:%u, %umV/500mA)\r\n",
+	printf("TX Request PPS (PDO Index:%u, %umV @ 500mA)\r\n",
 	       (unsigned)best_idx, (unsigned)req_mv);
 	PD_TX_BUF[1] = (u16)(rdo & 0xFFFFu);
 	PD_TX_BUF[2] = (u16)((rdo >> 16) & 0xFFFFu);
@@ -2395,6 +2474,7 @@ void PD_EPR_Enter_Probe_If_Capable(void)
 	}
 	if ( s_epr_sinkcap_sent == 0 ) {
 		s_epr_sinkcap_sent = 1;
+		s_pd_result_protocol_critical = 1u;
 		printf("TX Sink_Capabilities (EPR APDO; wait SoftReset or 150ms then Enter)\r\n");
 		Delay_Ms(20);
 		PD_PHY.TxSop = PD_PHY_TX_SOP;
@@ -2434,6 +2514,7 @@ void PD_EPR_Enter_Probe_If_Capable(void)
 		return;
 	}
 	PD_Source_VDM_Probe_Cancel();
+	s_pd_result_protocol_critical = 1u;
 	PD_EPR_Reassembly_Reset();
 	s_pd_result.epr_enter_status = PD_RESULT_STATUS_PENDING;
 	s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
@@ -2905,6 +2986,8 @@ void pDevice_Unattached(void)
 	PD_PostExit_Request_DelayMs = 0;
 	PD_Dell_PreEPR_SettleActive = 0;
 	PD_EPR_Probe_Done = 0;
+	s_pd_result_protocol_critical = 0u;
+	s_epr_print_pending = 0u;
 	PD_PPS_Probe_Done = 0;
 	PD_InfoProbe_SoftRst_Recovery_5V_Cnt = 0;
 	s_epr_sinkcap_sent = 0;
@@ -3618,6 +3701,10 @@ void pProt_RX_PS_RDY(void)
 		VDM_State.Explicit_Contract_Established = 1;
 		s_pd_result.spr_contract_status = PD_RESULT_STATUS_PASS;
 		s_pd_result_dirty |= PD_RESULT_DIRTY_PROTOCOL;
+		if ( PD_EPR_Probe_Done ) {
+			/* Post-Exit SPR contract is stable; deferred UART output is safe now. */
+			s_pd_result_protocol_critical = 0u;
+		}
 
 		/* 契約確立後に遅延表示: Source_Cap → Request → 結果 の順に出力 */
 		PD_Print_Source_Capabilities_Deferred();

@@ -60,6 +60,27 @@ def format_voltage(mv: int) -> str:
     return f"{mv / 1000:.1f}V"
 
 
+def format_current(ma: int) -> str:
+    if ma % 1000 == 0:
+        return f"{ma // 1000}A"
+    return f"{ma / 1000:.2f}".rstrip("0").rstrip(".") + "A"
+
+
+def format_voltage_range(min_mv: int, max_mv: int) -> str:
+    return f"{format_voltage(min_mv).removesuffix('V')}-{format_voltage(max_mv)}"
+
+
+def spr_avs_capability_text(decoded: dict[str, object]) -> str:
+    min_mv = as_int(decoded.get("min_mv"))
+    max_mv = as_int(decoded.get("max_mv"))
+    ma_15v = as_int(decoded.get("max_ma_15v"))
+    ma_20v = as_int(decoded.get("max_ma_20v"))
+    ranges = [f"9-15V @ {format_current(ma_15v)}"]
+    if ma_20v:
+        ranges.append(f"15-20V @ {format_current(ma_20v)}")
+    return f"{format_voltage_range(min_mv, max_mv)} ({' / '.join(ranges)})"
+
+
 def parse_pdo(value: object) -> int:
     try:
         return int(str(value), 16) & 0xFFFFFFFF
@@ -77,9 +98,12 @@ def decode_pdo(raw: int, object_number: int, region: str) -> dict[str, object]:
         "min_mv": 0,
         "max_mv": 0,
         "max_ma": 0,
+        "max_ma_15v": 0,
+        "max_ma_20v": 0,
         "max_mw": 0,
         "pdp_w": 0,
         "power_limited": "",
+        "peak_current": "",
     }
     if pdo_type == 0:
         mv = ((raw >> 10) & 0x3FF) * 50
@@ -88,7 +112,7 @@ def decode_pdo(raw: int, object_number: int, region: str) -> dict[str, object]:
             kind=f"FIXED_{region}", min_mv=mv, max_mv=mv, max_ma=ma,
             max_mw=mv * ma // 1000,
         )
-        description = f"Fixed {format_voltage(mv)} {ma / 1000:g}A"
+        description = f"Fixed {format_voltage(mv)} @ {format_current(ma)}"
     elif pdo_type == 1:
         max_mv = ((raw >> 20) & 0x3FF) * 50
         min_mv = ((raw >> 10) & 0x3FF) * 50
@@ -110,8 +134,8 @@ def decode_pdo(raw: int, object_number: int, region: str) -> dict[str, object]:
             max_ma=ma, max_mw=max_mv * ma // 1000,
         )
         description = (
-            f"Variable {format_voltage(min_mv)}-{format_voltage(max_mv)} "
-            f"{ma / 1000:g}A"
+            f"Variable {format_voltage_range(min_mv, max_mv)} "
+            f"@ {format_current(ma)}"
         )
     else:
         apdo_type = (raw >> 28) & 0x03
@@ -126,10 +150,10 @@ def decode_pdo(raw: int, object_number: int, region: str) -> dict[str, object]:
                 power_limited=str(limited),
             )
             description = (
-                f"PPS {format_voltage(min_mv)}-{format_voltage(max_mv)} "
-                f"{ma / 1000:g}A"
+                f"PPS {format_voltage_range(min_mv, max_mv)} "
+                f"@ {format_current(ma)}"
             )
-        elif apdo_type in (1, 2):
+        elif apdo_type == 1:
             max_mv = ((raw >> 17) & 0x1FF) * 100
             min_mv = ((raw >> 8) & 0x1FF) * 100
             pdp_w = raw & 0xFF
@@ -138,9 +162,22 @@ def decode_pdo(raw: int, object_number: int, region: str) -> dict[str, object]:
                 max_mw=pdp_w * 1000, pdp_w=pdp_w,
             )
             description = (
-                f"AVS {format_voltage(min_mv)}-{format_voltage(max_mv)} "
+                f"AVS {format_voltage_range(min_mv, max_mv)} "
                 f"PDP {pdp_w}W"
             )
+        elif apdo_type == 2:
+            ma_15v = ((raw >> 10) & 0x3FF) * 10
+            ma_20v = (raw & 0x3FF) * 10
+            max_mv = 20000 if ma_20v else 15000
+            peak = (raw >> 26) & 0x03
+            decoded.update(
+                kind="APDO_SPR_AVS", min_mv=9000, max_mv=max_mv,
+                max_ma=max(ma_15v, ma_20v), max_ma_15v=ma_15v,
+                max_ma_20v=ma_20v,
+                max_mw=max(15000 * ma_15v, 20000 * ma_20v) // 1000,
+                peak_current=str(peak),
+            )
+            description = f"SPR AVS {spr_avs_capability_text(decoded)} Peak {peak}"
         else:
             description = "Reserved APDO"
     decoded["description"] = f"#{object_number} {description} ({decoded['raw']})"
@@ -202,6 +239,20 @@ def epr_pdo_fields(epr: dict[str, object]) -> tuple[str, str]:
         f"#{number}=0x{raw:08X}" for number, raw in sorted(raw_pdos.items())
     )
     return details, raw_text
+
+
+def spr_avs_fields(source: dict[str, object]) -> str:
+    pdos = source.get("pdos", {})
+    if not isinstance(pdos, dict):
+        return "None"
+    values: list[str] = []
+    for number_text, raw_text in sorted(pdos.items(), key=lambda item: as_int(item[0])):
+        number = as_int(number_text)
+        raw = parse_pdo(raw_text)
+        decoded = decode_pdo(raw, number, "SPR")
+        if decoded["kind"] == "APDO_SPR_AVS":
+            values.append(spr_avs_capability_text(decoded))
+    return "; ".join(values) if values else "None"
 
 
 def status_text(value: object) -> str:
@@ -526,6 +577,7 @@ def make_row(result_path: Path, captures: Path) -> dict[str, str]:
     source_roles, source_flags, spr_pdos, spr_pdo_raw = source_capability_fields(
         source if isinstance(source, dict) else {}
     )
+    spr_avs = spr_avs_fields(source if isinstance(source, dict) else {})
     epr_pdos, epr_pdo_raw = epr_pdo_fields(epr if isinstance(epr, dict) else {})
 
     if not epr_capable:
@@ -563,6 +615,7 @@ def make_row(result_path: Path, captures: Path) -> dict[str, str]:
         "Overall": overall,
         "SPR": f"{pdo_count} PDO / Max {max_power}",
         "PPS": "None" if pps_count == 0 else f"{pps_count} APDO",
+        "SPR AVS": spr_avs,
         "EPR fixed": epr_fixed,
         "AVS": avs,
         "PDP": f"{pdp}W" if pdp else "N/A",
@@ -611,6 +664,7 @@ CSV_FIELDS = [
     "Overall",
     "SPR",
     "PPS",
+    "SPR AVS",
     "EPR fixed",
     "AVS",
     "PDP",
@@ -670,6 +724,7 @@ SOURCE_CSV_FIELDS = [
     "best_overall",
     "spr_summary",
     "pps_summary",
+    "spr_avs",
     "epr_fixed",
     "avs",
     "pdp",
@@ -746,6 +801,7 @@ def discover_source_rows(session_rows: list[dict[str, str]]) -> list[dict[str, o
         "best_overall": "Overall",
         "spr_summary": "SPR",
         "pps_summary": "PPS",
+        "spr_avs": "SPR AVS",
         "epr_fixed": "EPR fixed",
         "avs": "AVS",
         "pdp": "PDP",
@@ -798,9 +854,12 @@ PDO_CSV_FIELDS = [
     "min_voltage_mv",
     "max_voltage_mv",
     "max_current_ma",
+    "max_current_15v_ma",
+    "max_current_20v_ma",
     "max_power_mw",
     "pdp_w",
     "power_limited",
+    "peak_current",
     "dual_role_power",
     "usb_suspend_supported",
     "unconstrained_power",
@@ -860,9 +919,12 @@ def discover_pdo_rows(captures: Path) -> list[dict[str, object]]:
                         "min_voltage_mv": decoded["min_mv"],
                         "max_voltage_mv": decoded["max_mv"],
                         "max_current_ma": decoded["max_ma"],
+                        "max_current_15v_ma": decoded["max_ma_15v"],
+                        "max_current_20v_ma": decoded["max_ma_20v"],
                         "max_power_mw": decoded["max_mw"],
                         "pdp_w": decoded["pdp_w"],
                         "power_limited": decoded["power_limited"],
+                        "peak_current": decoded["peak_current"],
                         "description": decoded["description"],
                     })
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1051,6 +1113,7 @@ def write_html(path: Path, rows: list[dict[str, str]]) -> None:
             html_cell(row["Overall"], f"status {status_class}"),
             html_cell(row["SPR"]),
             html_cell(row["PPS"]),
+            html_cell(row["SPR AVS"]),
             html_cell(row["EPR fixed"]),
             html_cell(row["AVS"]),
             html_cell(row["PDP"]),
@@ -1163,13 +1226,13 @@ tbody tr:hover {{ background: #e8f1fb; }}
 <thead>
   <tr class="group">
     <th colspan="4">Capture context</th><th colspan="1">Result</th>
-    <th colspan="11">Core negotiated source capabilities</th>
+    <th colspan="12">Core negotiated source capabilities</th>
     <th colspan="8">Optional source probes</th>
     <th colspan="4">Passive SOP′ cable observation</th>
     <th colspan="8">Protocol outcome</th>
   </tr>
 <tr>
-  <th>Captured</th><th>Source ID</th><th>Cable ID</th><th>Cable Attachment</th><th>Overall</th><th>SPR</th><th>PPS</th>
+  <th>Captured</th><th>Source ID</th><th>Cable ID</th><th>Cable Attachment</th><th>Overall</th><th>SPR</th><th>PPS</th><th>SPR AVS</th>
   <th>EPR Fixed</th><th>AVS</th><th>PDP</th><th>Power/Data Roles</th>
   <th>Source Flags</th><th>SPR PDO Details</th><th>SPR PDO Raw</th>
   <th>EPR PDO Details</th><th>EPR PDO Raw</th><th>Source Identity</th>

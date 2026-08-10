@@ -14,7 +14,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Iterable, TextIO
 
-from pd_report import DEFAULT_CAPTURES, generate_reports
+from pd_report import (
+    DEFAULT_CAPTURES,
+    decode_pdo,
+    generate_reports,
+    spr_avs_capability_text,
+)
 
 try:
     import serial
@@ -296,20 +301,34 @@ class SessionState:
             "[Source Summary]",
             f"SPR : {pdo_count} PDO / {pps_text} / Max {format_power(max_mw)}",
         ]
+        spr_avs = []
+        for index, raw_text in sorted(self.spr_pdos.items()):
+            decoded = decode_pdo(as_int(raw_text, base=16), index, "SPR")
+            if decoded["kind"] == "APDO_SPR_AVS":
+                spr_avs.append(spr_avs_capability_text(decoded))
+        if spr_avs:
+            source_lines.append("SPR AVS : " + "; ".join(spr_avs))
 
         if as_int(self.spr.get("epr_capable")) == 0:
             source_lines.append("EPR : not advertised")
         elif as_int(self.epr.get("complete")) == 1:
             fixed = [format_voltage(mv) for _, (mv, _) in sorted(self.epr_fixed.items()) if mv]
-            epr_parts = [", ".join(fixed) if fixed else "no fixed EPR PDO"]
+            source_lines.append(
+                "EPR Fixed : " + (", ".join(fixed) if fixed else "none")
+            )
             avs_min = as_int(self.epr.get("avs_min_mv"))
             avs_max = as_int(self.epr.get("avs_max_mv"))
             pdp = as_int(self.epr.get("pdp_w"))
             if avs_min and avs_max:
-                epr_parts.append(f"AVS {format_voltage(avs_min)}-{format_voltage(avs_max)}")
-            if pdp:
-                epr_parts.append(f"PDP {pdp}W")
-            source_lines.append("EPR : " + " / ".join(epr_parts))
+                avs_text = (
+                    f"{format_voltage(avs_min).removesuffix('V')}-"
+                    f"{format_voltage(avs_max)}"
+                )
+                if pdp:
+                    avs_text += f" (PDP {pdp}W)"
+                source_lines.append("EPR AVS : " + avs_text)
+            elif pdp:
+                source_lines.append(f"EPR PDP : {pdp}W")
         else:
             source_lines.append("EPR : advertised / data unavailable")
 

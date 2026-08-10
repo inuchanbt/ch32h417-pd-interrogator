@@ -17,7 +17,7 @@ from pd_capture import (
     decode_source_cap_ext_from_log,
     parse_record,
 )
-from pd_report import DEFAULT_CAPTURES, automatic_cable_id, generate_reports
+from pd_report import DEFAULT_CAPTURES, automatic_cable_id, decode_pdo, generate_reports
 
 
 SAMPLE = b"""boot noise\r\n
@@ -39,6 +39,37 @@ tx@PD1,type=identity,session=1,status=pass,probe=nak,vid=0000,pid=0000,id_header
 
 
 class CaptureTests(unittest.TestCase):
+    def test_spr_avs_apdo_decoding(self):
+        decoded = decode_pdo(0xE404B1F4, 5, "SPR")
+        self.assertEqual(decoded["kind"], "APDO_SPR_AVS")
+        self.assertEqual(decoded["min_mv"], 9000)
+        self.assertEqual(decoded["max_mv"], 20000)
+        self.assertEqual(decoded["max_ma_15v"], 3000)
+        self.assertEqual(decoded["max_ma_20v"], 5000)
+        self.assertEqual(decoded["max_mw"], 100000)
+        self.assertEqual(decoded["peak_current"], "1")
+        self.assertIn("SPR AVS 9-20V (9-15V @ 3A / 15-20V @ 5A)", decoded["description"])
+
+    def test_epr_avs_apdo_decoding_is_unchanged(self):
+        decoded = decode_pdo(0xD7C096F0, 11, "EPR")
+        self.assertEqual(decoded["kind"], "APDO_EPR_AVS")
+        self.assertEqual(decoded["min_mv"], 15000)
+        self.assertEqual(decoded["max_mv"], 48000)
+        self.assertEqual(decoded["pdp_w"], 240)
+        self.assertIn("AVS 15-48V PDP 240W", decoded["description"])
+
+    def test_spr_avs_renders_in_session_summary(self):
+        state = SessionState(1)
+        state.apply({
+            "type": "spr", "pdo_count": "5", "pps_count": "0",
+            "spr_avs_count": "1", "max_mw": "100000", "epr_capable": "1",
+        })
+        state.apply({"type": "spr_pdo", "index": "5", "raw": "E404B1F4"})
+        self.assertIn(
+            "SPR AVS : 9-20V (9-15V @ 3A / 15-20V @ 5A)",
+            state.render_summary(),
+        )
+
     def test_default_capture_path_is_project_relative(self):
         self.assertEqual(build_parser().parse_args([]).output, DEFAULT_CAPTURES)
 
@@ -121,7 +152,8 @@ class CaptureTests(unittest.TestCase):
                 state.apply(record)
         summary = state.render_summary()
         self.assertIn("5 PDO / PPS none / Max 100W", summary)
-        self.assertIn("28V, 36V, 48V / AVS 15V-48V / PDP 240W", summary)
+        self.assertIn("EPR Fixed : 28V, 36V, 48V", summary)
+        self.assertIn("EPR AVS : 15-48V (PDP 240W)", summary)
         self.assertIn("Passive / 5A / 48V / USB4 Gen4", summary)
         self.assertIn("Revision : PD 3.1 / USB 1.8", summary)
         self.assertIn("Manufacturer : Example Power", summary)
@@ -466,7 +498,7 @@ class CaptureTests(unittest.TestCase):
             self.assertIn("CountryCodes=UNSUPPORTED", report)
             self.assertIn("source_info: pdp_w=140", report)
             self.assertIn("Power: DRP / Data: DRD", report)
-            self.assertIn("#1 Fixed 5V 3A (0x2A81912C)", report)
+            self.assertIn("#1 Fixed 5V @ 3A (0x2A81912C)", report)
             self.assertIn("Passive / 5A / 48V / USB2 only", report)
             self.assertIn("session_0001/raw.log", report)
             self.assertIn('href="pdo_table.csv"', report)
