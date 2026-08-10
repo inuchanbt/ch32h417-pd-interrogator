@@ -66,6 +66,12 @@ static u8 PD_Request_Fail_Count = 0;
 static u8 PD_Request_Stop_After_Fail = 0;
 static u8 PD_Request_Async_Rx_Count = 0;
 static u16 PD_PostExit_Request_DelayMs = 0;
+static u8 PD_Request_Guard_StartMs = 0;
+static u8 PD_Dell_PreEPR_SettleActive = 0;
+static u32 PD_Dell_PreEPR_SettleStartMs = 0;
+#define PD_DELL_LA280PM240_SRC_CAP_FP 0x985E5B15u
+#define PD_DELL_PRE_EPR_AMS_GUARD_MS  24u
+#define PD_DELL_PRE_EPR_SETTLE_MS     960u
 static u16 PD_Suppressed_SrcCap_Count = 0;
 static u32 PD_Current_SrcCap_Fingerprint = 0;
 static u32 PD_Failed_SrcCap_Fingerprint = 0;
@@ -577,16 +583,44 @@ static void pProt_Request_TxFailed(void);
 static void pProt_Request_RxTimeout(void);
 static void pProt_PS_RDY_Failed(void);
 
+static void PD_Request_Arm_Guard(u16 delay_ms)
+{
+	PD_PostExit_Request_DelayMs = delay_ms;
+	/*
+	 * Use the interrupt-driven clock directly.  The delta passed to the next
+	 * timer tick was sampled before deferred RX/UART work and may include time
+	 * from before this guard existed, which previously shortened the guard on
+	 * the wire.
+	 */
+	PD_Request_Guard_StartMs = Tim_Ms_Cnt;
+}
+
 void PD_Request_Arbiter_Tick(u8 delta_ms)
 {
+	(void)delta_ms;
+	if ( PD_Dell_PreEPR_SettleActive ) {
+		if ( !PD_DEVICE.ConnectStat ) {
+			PD_Dell_PreEPR_SettleActive = 0u;
+		} else if ( (u32)(PD_PHY.TimeMs - PD_Dell_PreEPR_SettleStartMs) >=
+		            PD_DELL_PRE_EPR_SETTLE_MS ) {
+			/* Do not overwrite RX/TX state while the source AMS is still active. */
+			if ( PD_PHY.WaitMsgTx || PD_PHY.WaitMsgRx ||
+			     (USBPD->CONTROL & PD_TX_EN) != 0u ) {
+				return;
+			}
+			PD_Dell_PreEPR_SettleActive = 0u;
+			printf("Dell pre-EPR settle complete; send Sink_Capabilities\r\n");
+			PD_EPR_Enter_Probe_If_Capable();
+		}
+		return;
+	}
 	if ( PD_PostExit_Request_DelayMs == 0u ) return;
 	if ( !PD_DEVICE.ConnectStat ) {
 		PD_PostExit_Request_DelayMs = 0u;
 		return;
 	}
-	if ( PD_PostExit_Request_DelayMs > delta_ms ) {
-		PD_PostExit_Request_DelayMs =
-			(u16)(PD_PostExit_Request_DelayMs - delta_ms);
+	if ( (u8)(Tim_Ms_Cnt - PD_Request_Guard_StartMs) <
+	     PD_PostExit_Request_DelayMs ) {
 		return;
 	}
 
@@ -597,7 +631,7 @@ void PD_Request_Arbiter_Tick(u8 delta_ms)
 	 */
 	if ( PD_PHY.WaitMsgTx || PD_PHY.WaitMsgRx ||
 	     (USBPD->CONTROL & PD_TX_EN) != 0u ) {
-		PD_PostExit_Request_DelayMs = 1u;
+		PD_Request_Arm_Guard(1u);
 		return;
 	}
 
@@ -1545,7 +1579,7 @@ static void PD_EPR_Exit_RX(void)
 				VDM_State.Explicit_Contract_Established = 0;
 				PD_PHY.WaitMsgRx = 0u;
 				PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
-				PD_PostExit_Request_DelayMs = 15u;
+				PD_Request_Arm_Guard(15u);
 				return;
 			}
 			printf("EPR Mode Exit: asynchronous message 0x%02X (NDO=%d Extended=%d); "
@@ -2620,6 +2654,8 @@ static void PD_InfoProbe_Chunk_Timeout(void)
  */
 static void PD_InfoProbe_TxFailed(void)
 {
+	u8 failed_step = PD_InfoProbe_Step;
+
 	printf("\r\nProbe %s: TX no GoodCRC (source may not support this message type at PHY level)\r\n",
 		PD_InfoProbe_Name(PD_InfoProbe_Step));
 	PD_PHY.WaitMsgRx = 0;
@@ -2638,6 +2674,19 @@ static void PD_InfoProbe_TxFailed(void)
 	VDM_Reset_Disc_State();
 	printf("Probe unsupported: TX no GoodCRC; cancel remaining GET_* probes and try EPR path now\r\n");
 	PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
+	if ( failed_step == 8u &&
+	     PD_Current_SrcCap_Fingerprint == PD_DELL_LA280PM240_SRC_CAP_FP ) {
+		/*
+		 * The Object-5 trace shows Dell initiating Discover SVIDs about 48 ms
+		 * after the malformed BatteryCap attempt, then accepting SinkCap about
+		 * 0.98 s after that attempt.  Stay RX-only through that source AMS.
+		 */
+		PD_Dell_PreEPR_SettleActive = 1u;
+		PD_Dell_PreEPR_SettleStartMs = PD_PHY.TimeMs;
+		printf("Dell BatteryCap TX failed: listen %ums for source AMS before SinkCap/EPR\r\n",
+		       (unsigned)PD_DELL_PRE_EPR_SETTLE_MS);
+		return;
+	}
 	PD_EPR_Enter_Probe_If_Capable();
 }
 
@@ -2808,6 +2857,7 @@ void pDevice_Attached(void)
 	PD_Request_Stop_After_Fail  = 0;
 	PD_Request_Fail_Count       = 0;
 	PD_PostExit_Request_DelayMs = 0;
+	PD_Dell_PreEPR_SettleActive = 0;
 	PD_Suppressed_SrcCap_Count  = 0;
 	PD_Stored_SrcCap_NDO        = 0;
 	PD_InfoProbe_Skip_Mask      = 0;
@@ -2853,6 +2903,7 @@ void pDevice_Unattached(void)
 	PD_InfoProbe_NoResponseCnt = 0;
 	PD_InfoProbe_Done = 0;
 	PD_PostExit_Request_DelayMs = 0;
+	PD_Dell_PreEPR_SettleActive = 0;
 	PD_EPR_Probe_Done = 0;
 	PD_PPS_Probe_Done = 0;
 	PD_InfoProbe_SoftRst_Recovery_5V_Cnt = 0;
@@ -2878,16 +2929,21 @@ void pProt_IDLE(void)
 
 	VDM_Sniff_SOPP_Cable();
 
-	if ( PD_PostExit_Request_DelayMs != 0u &&
+	if ( (PD_Dell_PreEPR_SettleActive || PD_PostExit_Request_DelayMs != 0u) &&
 	     PD_PHY.LastRxSop == PD_PHY_RX_SOP &&
 	     !rxHeader->Extended && rxHeader->NDO > 0u &&
 	     rxHeader->MsgType == PD_Data_VendorDefined ) {
 		if ( vdm->Type && vdm->CommandType == 0u &&
 		     vdm->Command == PD_VDM_DiscoverSVIDs &&
 		     vdm->SVID == 0xFF00u ) {
-			printf("RX Discover SVIDs during Request guard; "
-			       "hardware GoodCRC only\r\n");
-			PD_PostExit_Request_DelayMs = 15u;
+			if ( PD_Dell_PreEPR_SettleActive ) {
+				printf("RX Dell Discover SVIDs during pre-EPR settle; "
+				       "hardware GoodCRC only\r\n");
+			} else {
+				printf("RX Discover SVIDs during Request guard; "
+				       "hardware GoodCRC only\r\n");
+				PD_Request_Arm_Guard(15u);
+			}
 			PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
 			return;
 		}
@@ -3218,18 +3274,29 @@ void pProt_RX_SrcCap(void)
 
 			printf("RX Source_Capabilities after contract — Request Fixed PDO1\r\n");
 			PD_User_Snk_Rx_SrcCap();
-			if ( PD_InfoProbe_Done || PD_EPR_Probe_Done ) {
+			if ( PD_EPR_Probe_Done ||
+			     (PD_InfoProbe_Done &&
+			      PD_Current_SrcCap_Fingerprint == PD_DELL_LA280PM240_SRC_CAP_FP) ) {
 				/*
-				 * LA280PM240 starts a source-initiated Discover SVIDs AMS about
-				 * 0.4ms after Source_Capabilities.  Hold Request briefly so
-				 * the source AMS can receive its empty ACK, but stay below the
-				 * source's approximately 30 ms transition deadline.
-			 */
-			VDM_State.Explicit_Contract_Established = 0;
-			PD_PostExit_Request_DelayMs = 15u;
+				 * LA280PM240 starts a source-initiated Discover SVIDs AMS around
+				 * Source_Capabilities.  Its Object 5 success trace receives that VDM
+				 * during the guard, lets the source AMS expire, then sends Request.
+				 *
+				 * LA280PM240 Hard Resets if Request is not received about 30 ms after
+				 * Source_Capabilities.  Keep this Dell-only guard below that limit;
+				 * its post-Accept Discover SVIDs is handled in the PS_RDY wait.
+				 * Other sources retain their existing timing.  After EPR Exit, keep
+				 * the established 15 ms guard for the source's follow-up AMS.
+				 */
+				VDM_State.Explicit_Contract_Established = 0;
+				PD_Request_Arm_Guard(PD_EPR_Probe_Done
+				                     ? 15u
+				                     : PD_DELL_PRE_EPR_AMS_GUARD_MS);
 				PD_PHY.WaitMsgRx = 0u;
 				PD_Prot_pSet( NULL , pProt_IDLE , NULL , NULL );
-				printf("Source_Capabilities after completed probes: hold Request 15ms for source AMS\r\n");
+				printf("%s Source_Capabilities: hold Request %ums for source AMS\r\n",
+				       PD_EPR_Probe_Done ? "Post-EPR" : "Dell pre-EPR",
+				       (unsigned)PD_PostExit_Request_DelayMs);
 			} else {
 				pProt_TX_Request();
 			}
@@ -3366,11 +3433,6 @@ static void pProt_Request_Rearm_After_Async(u8 waiting_ps_rdy)
 		(unsigned long)PD_PHY.TxStartTimestampMs,
 		(unsigned long)age_ms, arrival);
 
-	/*
-	 * LA280PM240 injects Discover SVIDs around Request/Accept and Hard Resets
-	 * after ACK, NAK, or BUSY from this analyzer.  The known-good trace has
-	 * only the PHY-generated GoodCRC, followed by continued Request handling.
-	 */
 	if ( is_discover_svid ) {
 		printf("Quarantine asynchronous Discover SVIDs during Request %s wait; "
 		       "hardware GoodCRC only and keep waiting\r\n", phase);
@@ -3625,6 +3687,7 @@ void pProt_TX_SoftRst(void)
 {
 	DEBUG_Print("TX SoftRST\r\n");
 	PD_PostExit_Request_DelayMs = 0;
+	PD_Dell_PreEPR_SettleActive = 0;
 	PD_PHY.TxMsgID = PD_PHY.RxMsgID = 0;
 	VDM_State.Explicit_Contract_Established = 0;
 	VDM_State.Enter_Mode_already = 0;
@@ -3665,6 +3728,7 @@ void pProt_RX_SoftRst(void)
 {
 	DEBUG_Print("Rx SoftRST\r\n");
 	PD_PostExit_Request_DelayMs = 0;
+	PD_Dell_PreEPR_SettleActive = 0;
 	/*
 	 * Cancel the interrupted AMS before preparing Accept.  In particular,
 	 * prevent a queued GET_* or chunk request from being emitted after the
