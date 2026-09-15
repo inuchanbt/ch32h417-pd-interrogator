@@ -10,11 +10,13 @@ the nanoCH32H417 hardware with external 5.1 kohm CC pull-down resistors.
 
 ## Project layout
 
-- `USBPD/USBPD_SNK/Common`: PD protocol, PHY, analyzer, and decoder logic
-- `USBPD/USBPD_SNK/V3F`: primary V3F MounRiver project
-- `USBPD/USBPD_SNK/V5F`: companion V5F MounRiver project
-- `SRC`: WCH startup, peripheral, core, and linker support referenced by both
-  projects
+- `firmware/USBPD_SNK/Common`: PD protocol, PHY, analyzer, and decoder logic
+- `firmware/USBPD_SNK/V3F`: primary V3F MounRiver project
+- `firmware/USBPD_SNK/V5F`: companion V5F MounRiver project
+- `vendor/wch/SRC`: WCH startup, peripheral, core, and linker support
+- `tools`: capture, reporting, and measurement setup utilities
+- `docs`: hardware preparation and project documentation
+- `captures`: local measurement data and profiles (excluded from Git)
 
 ## Hardware preparation (nanoCH32H417 V1.0)
 
@@ -31,14 +33,21 @@ This is a required hardware setup step for this board, not a firmware setting.
 The photo applies to the V1.0 board shown; check the jumper layout if using a
 different board revision.
 
+The repository is self-contained: the surrounding WCH EVT distribution is not
+needed to build it. Open this repository as the working folder. When migrating
+from the old `EVT/EXAM` layout, reopen the solution below and rebuild both cores
+to regenerate IDE caches. Copy the entire `captures` directory to retain logs,
+profiles, and favorites, and update the dashboard
+`ch32_capture_root` setting to the new `captures` directory.
+
 ## Building
 
-Open `USBPD/USBPD_SNK/USBPD_SNK.wvsln` with MounRiver Studio 2.
+Open `firmware/USBPD_SNK/USBPD_SNK.wvsln` with MounRiver Studio 2.
 
 Build the V3F project first, then rebuild the V5F project. The image used for
 programming is:
 
-`USBPD/USBPD_SNK/V5F/obj/Merge.Bin`
+`firmware/USBPD_SNK/V5F/obj/Merge.Bin`
 
 The analyzer UART is configured for 460800 baud.
 

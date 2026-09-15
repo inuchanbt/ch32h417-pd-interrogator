@@ -17,19 +17,19 @@
 		"linkedFolders": [
 			{
 				"name": "Core",
-				"location": "../../../SRC/Core"
+				"location": "../../../vendor/wch/SRC/Core"
 			},
 			{
 				"name": "Ld",
-				"location": "../../../SRC/Ld"
+				"location": "../../../vendor/wch/SRC/Ld"
 			},
 			{
 				"name": "Peripheral",
-				"location": "../../../SRC/Peripheral"
+				"location": "../../../vendor/wch/SRC/Peripheral"
 			},
 			{
 				"name": "Startup",
-				"location": "../../../SRC/Startup"
+				"location": "../../../vendor/wch/SRC/Startup"
 			},
 			{
 				"name": "Common",

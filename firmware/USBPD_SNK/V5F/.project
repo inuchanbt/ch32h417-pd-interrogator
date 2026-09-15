@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <projectDescription>
-  <name>USBPD_SNK_V3F</name>
+  <name>USBPD_SNK_V5F</name>
   <comment/>
   <projects/>
   <buildSpec>
@@ -24,22 +24,22 @@
     <link>
       <name>Core</name>
       <type>2</type>
-      <location>PARENT-3-PROJECT_LOC/SRC/Core</location>
+      <location>PARENT-3-PROJECT_LOC/vendor/wch/SRC/Core</location>
     </link>
     <link>
       <name>Ld</name>
       <type>2</type>
-      <location>PARENT-3-PROJECT_LOC/SRC/Ld</location>
+      <location>PARENT-3-PROJECT_LOC/vendor/wch/SRC/Ld</location>
     </link>
     <link>
       <name>Peripheral</name>
       <type>2</type>
-      <location>PARENT-3-PROJECT_LOC/SRC/Peripheral</location>
+      <location>PARENT-3-PROJECT_LOC/vendor/wch/SRC/Peripheral</location>
     </link>
     <link>
       <name>Startup</name>
       <type>2</type>
-      <location>PARENT-3-PROJECT_LOC/SRC/Startup</location>
+      <location>PARENT-3-PROJECT_LOC/vendor/wch/SRC/Startup</location>
     </link>
     <link>
       <name>Common</name>
