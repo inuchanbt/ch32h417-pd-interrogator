@@ -16,6 +16,21 @@ the nanoCH32H417 hardware with external 5.1 kohm CC pull-down resistors.
 - `SRC`: WCH startup, peripheral, core, and linker support referenced by both
   projects
 
+## Hardware preparation (nanoCH32H417 V1.0)
+
+Before using the nanoCH32H417 V1.0 as a PD sink, enable its external
+5.1 kΩ CC pull-down resistors by solder-bridging **both jumper locations
+circled in red** in the photo below, next to the `USB-FS` USB-C connector.
+Bridge the two pads within each circle separately; do not connect the two
+circled locations to each other. Disconnect all power and USB cables before
+soldering.
+
+![nanoCH32H417 V1.0: the two CC resistor solder jumpers to bridge](docs/images/nanoch32h417-v1-cc-jumpers.png)
+
+This is a required hardware setup step for this board, not a firmware setting.
+The photo applies to the V1.0 board shown; check the jumper layout if using a
+different board revision.
+
 ## Building
 
 Open `USBPD/USBPD_SNK/USBPD_SNK.wvsln` with MounRiver Studio 2.
