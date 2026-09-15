@@ -25,7 +25,7 @@ programming is:
 
 `USBPD/USBPD_SNK/V5F/obj/Merge.Bin`
 
-The analyzer UART is configured for 921600 baud.
+The analyzer UART is configured for 460800 baud.
 
 ## Capturing results
 
@@ -39,26 +39,86 @@ python tools/pd_capture.py --list
 python tools/pd_capture.py --port COM3 --source-id aohi-240w --source-manufacturer AOHI --source-model AOC-C022 --cable-id cable-01 --cable-attachment detachable
 ```
 
-The default baud rate is 921600. The tool normally prints only completed or
-updated summaries; add `--verbose` to echo every firmware debug line. Each run
-is saved below `captures/` with the exact UART byte stream plus per-session
-artifacts:
+The default baud rate is 460800. The tool echoes every firmware debug line by
+default so attach and protocol progress remain visible; add `--quiet` to show
+only completed or updated summaries. Source port defaults to `C1`. For a
+`captive` cable, omitted cable manufacturer/model values inherit the source
+manufacturer/model. Each run is saved below `captures/` with the exact UART
+byte stream plus per-session artifacts:
 
 ```text
 captures/YYYYMMDD_HHMMSS_SOURCE_MANUFACTURER_SOURCE_MODEL/
   capture.json
-  raw.bin
-  raw.log
+  SOURCE__CABLE__pd-interrogate__YYYYMMDD_HHMMSS.bin
+  SOURCE__CABLE__pd-interrogate__YYYYMMDD_HHMMSS.log
   events.jsonl
   session_0001/
-    raw.log
+    SOURCE__CABLE__pd-interrogate__YYYYMMDD_HHMMSS__session-0001.log
     events.jsonl
     result.json
     summary.txt
 ```
 
 Saved structured logs can be processed again without hardware using
-`python tools/pd_capture.py --replay path/to/raw.log`.
+`python tools/pd_capture.py --replay path/to/saved.log`. Old `raw.log` files
+remain supported. `capture.json` and each `result.json` identify their log
+filename under `artifacts.raw_log`; `capture.json` also records `artifacts.raw_binary`.
+
+## Reusing measurement setups and searching history
+
+Use `python tools/pd_capture.py --help` and `python tools/pd_report.py --help`
+for all options and examples. Run the examples below from this project's root.
+
+Start the interactive setup chooser with:
+
+```powershell
+python tools/pd_capture.py --setup
+```
+
+Choose a saved setup (the last used one is offered), or register a new one.
+Saved setups include physical source/cable IDs, manufacturer/model, source port,
+cable length, AC input, firmware version, board revision, CC resistors,
+orientation, and a test note. Review the setup before starting capture.
+No measurement starts when you only save a profile:
+
+```powershell
+python tools/pd_capture.py --save-profile bench-aohi --source-id aohi-240w --source-manufacturer AOHI --source-model AOC-C022 --cable-id cable-01 --firmware-version r70 --cc-resistance external-5.1k
+python tools/pd_capture.py --profiles
+python tools/pd_capture.py --profile bench-aohi --port COM3 --orientation ura
+```
+
+Explicit command-line options override saved values for that run without changing
+the saved profile. `--save-profile NAME` updates that named profile. To register
+metadata from an existing capture without retyping it:
+
+```powershell
+python tools/pd_capture.py --from-capture captures/EXISTING_CAPTURE_FOLDER --save-profile my-adapter
+```
+
+New log names follow ASD-PD31's `SOURCE__CABLE__CONDITION__YYYYMMDD_HHMMSS`
+format and Windows filename sanitization, including `.` to `p`. Use `--source-name`
+and `--cable-name` to specify the same readable labels as ASD-PD31; otherwise
+labels are derived from device metadata. `--measurement-condition` defaults to
+`pd-interrogate`. Long labels are shortened to fit the capture path; full values
+remain in JSON. Capture directories are allocated exclusively; repeated runs in
+the same second get `_02`, `_03`, etc., without overwriting earlier evidence.
+
+`captures/measurements.sqlite3` stores saved profiles and a searchable session
+index. Raw logs and per-session JSON remain the evidence; the index can be
+refreshed from old and new capture directories without renaming or moving them:
+
+```powershell
+python tools/pd_report.py --history --source-id aohi-240w
+python tools/pd_report.py --history --cable-id cable-01 --limit 100
+```
+
+Re-indexing preserves saved profiles, result IDs, and favorites. Back up the
+whole `captures` directory, including the database (saved profiles) and
+`result_annotations.json` (favorites); rebuilding the index does not recreate
+profiles. Existing exports and dashboard matching columns remain supported.
+CSV exports add measurement condition, firmware, board, CC configuration,
+orientation, test note, capture ID, and relative raw-log path. Each CSV is replaced
+only after writing completes so readers do not see partially written rows.
 
 Every capture stop also refreshes the aggregate capability reports:
 
@@ -96,11 +156,31 @@ any time without connecting hardware:
 python tools/pd_report.py --captures captures
 ```
 
+For the interactive Results Viewer with persistent favorites, start the local
+server and open the printed URL (default: `http://127.0.0.1:8766/`):
+
+```powershell
+python tools/pd_report.py --captures captures --serve
+```
+
+The viewer classifies complete sessions as `Valid`, acquisition failures as
+`Failed`, and partial sessions as `Review`. Favorites are saved outside the
+immutable session evidence in `captures/result_annotations.json`. The generated
+`spec_table.csv` includes `Result ID`, `Result Status`, and `Favorite` columns so
+an ASD-PD31 import can preserve the annotation without automatically pairing the
+two measurements.
+
 The table includes PD/USB revision, Source Capabilities Extended identity,
 Source Info, manufacturer data, and a per-command support matrix when the
 source responds to the optional information probes.
 
 ## Current behavior
+
+Host-tool checks (saved-log replay only; no measurement hardware required):
+
+```powershell
+python -m unittest discover -s tools -p "test*.py" -v
+```
 
 - SPR fixed and PPS PDO decoding
 - Optional PPS contract/status probe followed by restoration to fixed 5 V

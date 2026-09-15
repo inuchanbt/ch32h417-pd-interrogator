@@ -17,7 +17,13 @@ from pd_capture import (
     decode_source_cap_ext_from_log,
     parse_record,
 )
-from pd_report import DEFAULT_CAPTURES, automatic_cable_id, decode_pdo, generate_reports
+from pd_report import (
+    DEFAULT_CAPTURES,
+    automatic_cable_id,
+    decode_pdo,
+    generate_reports,
+    save_favorite,
+)
 
 
 SAMPLE = b"""boot noise\r\n
@@ -71,7 +77,12 @@ class CaptureTests(unittest.TestCase):
         )
 
     def test_default_capture_path_is_project_relative(self):
-        self.assertEqual(build_parser().parse_args([]).output, DEFAULT_CAPTURES)
+        defaults = build_parser().parse_args([])
+        self.assertEqual(defaults.output, DEFAULT_CAPTURES)
+        self.assertEqual(defaults.baud, 460800)
+        self.assertEqual(defaults.source_port, "C1")
+        self.assertTrue(defaults.verbose)
+        self.assertFalse(build_parser().parse_args(["--quiet"]).verbose)
 
     def test_zero_cable_identity_has_no_automatic_id(self):
         self.assertEqual(
@@ -171,7 +182,7 @@ class CaptureTests(unittest.TestCase):
             root = capture.root
             capture.close()
             session = root / "session_0001"
-            self.assertTrue((root / "raw.bin").exists())
+            self.assertTrue(capture.raw_binary_path.exists())
             self.assertTrue((session / "events.jsonl").exists())
             self.assertIn("Overall      : PASS", (session / "summary.txt").read_text())
             self.assertIn('"overall": "PASS"', (session / "result.json").read_text())
@@ -504,7 +515,25 @@ class CaptureTests(unittest.TestCase):
             self.assertIn('href="pdo_table.csv"', report)
             self.assertIn('href="source_table.csv"', report)
             self.assertIn('href="cable_table.csv"', report)
+            self.assertIn('data-status-filter="valid"', report)
+            self.assertIn('id="favorites"', report)
+            self.assertIn('class="identifier cable-id"', report)
+            self.assertIn("overflow-wrap: anywhere", report)
+            self.assertIn(");<br>#2 Fixed", report)
             self.assertIn("Anker", csv_path.read_text(encoding="utf-8-sig").title())
+            csv_text = csv_path.read_text(encoding="utf-8-sig")
+            self.assertIn("Result ID,Result Status,Favorite", csv_text)
+            self.assertIn("Source Manufacturer,Source Model,Source Port", csv_text)
+            self.assertIn("Cable Manufacturer,Cable Model,Cable Length m", csv_text)
+            result_id = csv_text.splitlines()[1].split(",", 1)[0]
+            self.assertTrue(result_id.startswith("ch32h417:"))
+            save_favorite(captures, result_id, True)
+            generate_reports(captures)
+            self.assertIn(",Valid,Yes,", csv_path.read_text(encoding="utf-8-sig"))
+            annotations = json.loads(
+                (captures / "result_annotations.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(annotations["results"][result_id]["favorite"])
             pdo_csv = (captures / "pdo_table.csv").read_text(encoding="utf-8-sig")
             self.assertIn("dual_role_power", pdo_csv)
             self.assertIn("0x2A81912C", pdo_csv)
@@ -521,6 +550,20 @@ class CaptureTests(unittest.TestCase):
                 Path(temp), source_id="phihong", cable_attachment="captive"
             )
             self.assertEqual(capture.cable_id, "phihong:captive")
+            capture.close()
+
+    def test_captive_cable_defaults_to_source_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            capture = CaptureRun(
+                Path(temp),
+                cable_attachment="captive",
+                source_manufacturer="Lenovo",
+                source_model="ADL240WY3AA-D",
+            )
+            metadata = json.loads((capture.root / "capture.json").read_text())
+            self.assertEqual(metadata["source_port"], "C1")
+            self.assertEqual(metadata["cable_manufacturer"], "Lenovo")
+            self.assertEqual(metadata["cable_model"], "ADL240WY3AA-D")
             capture.close()
 
     def test_capture_folder_uses_source_manufacturer_and_model(self):

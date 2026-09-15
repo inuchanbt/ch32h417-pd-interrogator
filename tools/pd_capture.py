@@ -9,6 +9,8 @@ import os
 import re
 import sys
 import time
+import uuid
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +21,10 @@ from pd_report import (
     decode_pdo,
     generate_reports,
     spr_avs_capability_text,
+)
+from pd_store import (
+    PROFILE_FIELDS, last_profile, list_profiles, load_profile, measurement_stem,
+    save_profile,
 )
 
 try:
@@ -201,6 +207,7 @@ def decode_source_cap_ext_from_log(line: str) -> dict[str, str] | None:
 class SessionState:
     session: int
     firmware_session: int = 0
+    result_id: str = field(default_factory=lambda: f"ch32h417:{uuid.uuid4().hex}")
     records: list[dict[str, str]] = field(default_factory=list)
     attach: dict[str, str] = field(default_factory=dict)
     spr: dict[str, str] = field(default_factory=dict)
@@ -460,6 +467,7 @@ class SessionState:
 
     def as_json(self) -> dict[str, object]:
         return {
+            "result_id": self.result_id,
             "session": self.session,
             "firmware_session": self.firmware_session,
             "attach": self.attach,
@@ -496,13 +504,28 @@ class CaptureRun:
         cable_length_m: float | None = None,
         input_ac_voltage_v: float = 100.0,
         input_ac_frequency_hz: float = 50.0,
-        verbose: bool = False,
+        verbose: bool = True,
+        source_name: str = "",
+        cable_name: str = "",
+        measurement_condition: str = "pd-interrogate",
+        firmware_version: str = "",
+        board_revision: str = "",
+        cc_resistance: str = "",
+        orientation: str = "",
+        test_note: str = "",
     ) -> None:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        started = datetime.now().astimezone()
+        stamp = started.strftime("%Y%m%d_%H%M%S")
         source_id = source_id.strip()
         cable_id = cable_id.strip()
         source_manufacturer = source_manufacturer.strip()
         source_model = source_model.strip()
+        source_port = source_port.strip() or "C1"
+        cable_manufacturer = cable_manufacturer.strip()
+        cable_model = cable_model.strip()
+        if cable_attachment == "captive":
+            cable_manufacturer = cable_manufacturer or source_manufacturer
+            cable_model = cable_model or source_model
         if cable_attachment == "captive" and not cable_id and source_id:
             cable_id = f"{source_id}:captive"
         source_folder_parts = []
@@ -510,26 +533,48 @@ class CaptureRun:
             safe_value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
             if safe_value:
                 source_folder_parts.append(safe_value)
-        suffix = "_" + "_".join(source_folder_parts) if source_folder_parts else ""
+        suffix = ("_" + "_".join(source_folder_parts))[:70] if source_folder_parts else ""
         self.root = output / f"{stamp}{suffix}"
-        serial_number = 1
-        while self.root.exists():
-            self.root = output / f"{stamp}{suffix}_{serial_number:02d}"
-            serial_number += 1
-        self.root.mkdir(parents=True, exist_ok=False)
         self.source_id = source_id
         self.cable_id = cable_id
         self.cable_attachment = cable_attachment
         self.setup_metadata = {
             "source_manufacturer": source_manufacturer,
             "source_model": source_model,
-            "source_port": source_port.strip(),
-            "cable_manufacturer": cable_manufacturer.strip(),
-            "cable_model": cable_model.strip(),
+            "source_port": source_port,
+            "cable_manufacturer": cable_manufacturer,
+            "cable_model": cable_model,
             "cable_length_m": cable_length_m,
             "input_ac_voltage_v": input_ac_voltage_v,
             "input_ac_frequency_hz": input_ac_frequency_hz,
+            "source_name": source_name.strip(),
+            "cable_name": cable_name.strip(),
+            "measurement_condition": measurement_condition.strip() or "pd-interrogate",
+            "firmware_version": firmware_version.strip(),
+            "board_revision": board_revision.strip(),
+            "cc_resistance": cc_resistance.strip(),
+            "orientation": orientation.strip(),
+            "test_note": test_note.strip(),
+            "captured_at": started.isoformat(timespec="seconds"),
+            "capture_id": "ch32capture:" + uuid.uuid4().hex,
         }
+        naming_metadata = {**self.setup_metadata, "source_id": source_id,
+                           "cable_id": cable_id, "cable_attachment": cable_attachment}
+        # Leave room for session_0001, the per-session suffix, and Windows paths.
+        self.file_stem = measurement_stem(naming_metadata, stamp,
+                                         max_length=240 - len(str(self.root.resolve())) - 40)
+        serial_number = 2
+        while True:
+            try:
+                self.root.mkdir(parents=True, exist_ok=False)
+                break
+            except FileExistsError:
+                self.root = output / f"{stamp}{suffix}_{serial_number:02d}"
+                serial_number += 1
+        if serial_number > 2:
+            self.file_stem += f"_{serial_number - 1:02d}"
+        self.raw_log_path = self.root / f"{self.file_stem}.log"
+        self.raw_binary_path = self.root / f"{self.file_stem}.bin"
         (self.root / "capture.json").write_text(
             json.dumps(
                 {
@@ -538,6 +583,9 @@ class CaptureRun:
                     "cable_id": cable_id,
                     "cable_attachment": cable_attachment,
                     **self.setup_metadata,
+                    "artifacts": {"raw_log": self.raw_log_path.name,
+                                  "raw_binary": self.raw_binary_path.name,
+                                  "events": "events.jsonl"},
                 },
                 indent=2,
                 sort_keys=True,
@@ -545,8 +593,8 @@ class CaptureRun:
             encoding="utf-8",
         )
         self.verbose = verbose
-        self.raw_binary: BinaryIO = (self.root / "raw.bin").open("wb")
-        self.raw_text: TextIO = (self.root / "raw.log").open("w", encoding="utf-8", newline="")
+        self.raw_binary: BinaryIO = self.raw_binary_path.open("xb")
+        self.raw_text: TextIO = self.raw_log_path.open("x", encoding="utf-8", newline="")
         self.events: TextIO = (self.root / "events.jsonl").open("w", encoding="utf-8")
         self.sessions: dict[int, SessionState] = {}
         self.session_files: dict[int, tuple[Path, TextIO, TextIO]] = {}
@@ -695,7 +743,7 @@ class CaptureRun:
         state = SessionState(host_session, firmware_session)
         folder = self.root / f"session_{host_session:04d}"
         folder.mkdir(parents=True, exist_ok=False)
-        raw = (folder / "raw.log").open("w", encoding="utf-8", newline="")
+        raw = (folder / f"{self.file_stem}__session-{host_session:04d}.log").open("x", encoding="utf-8", newline="")
         events = (folder / "events.jsonl").open("w", encoding="utf-8")
         self.sessions[host_session] = state
         self.session_files[host_session] = (folder, raw, events)
@@ -727,8 +775,15 @@ class CaptureRun:
         result["cable_id"] = self.cable_id
         result["cable_attachment"] = self.cable_attachment
         result.update(self.setup_metadata)
+        result["artifacts"] = {"raw_log": Path(self.session_files[state.session][1].name).name,
+                               "events": "events.jsonl", "summary": "summary.txt"}
+        setup_lines = [f"{key.replace('_', ' ')}: {self.setup_metadata[key]}" for key in (
+            "measurement_condition", "firmware_version", "board_revision",
+            "cc_resistance", "orientation", "test_note",
+        ) if self.setup_metadata.get(key)]
+        summary = "[Measurement Setup]\n" + "\n".join(setup_lines) + "\n\n" + state.render_summary()
         files = (
-            (folder / "summary.txt", state.render_summary()),
+            (folder / "summary.txt", summary),
             (
                 folder / "result.json",
                 json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True)
@@ -853,10 +908,40 @@ def capture_serial(port: str, baud: int, capture: CaptureRun) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  python tools/pd_capture.py --setup
+  python tools/pd_capture.py --save-profile bench --source-id adapter-01 --cable-id cable-01
+  python tools/pd_capture.py --profile bench --port COM3 --orientation ura
+  python tools/pd_capture.py --from-capture captures/EXISTING_FOLDER --save-profile imported
+  python tools/pd_capture.py --profile bench --replay saved.log
+
+--save-profile only saves settings; it does not start acquisition.
+Explicit options override profile values for one run without editing the profile.
+New raw logs use SOURCE__CABLE__CONDITION__YYYYMMDD_HHMMSS names.
+The default output is the project's captures directory, independent of shell cwd.
+Logs and JSON remain evidence; measurements.sqlite3 holds profiles and an index.
+Capture shutdown refreshes the CSVs used by ASD-PD31 Dashboard.
+""",
+    )
     parser.add_argument("--port", help="serial port (auto-selected when unambiguous)")
-    parser.add_argument("--baud", type=int, default=921600)
+    parser.add_argument("--baud", type=int, default=460800)
     parser.add_argument("--output", type=Path, default=DEFAULT_CAPTURES)
+    setup_input = parser.add_mutually_exclusive_group()
+    setup_input.add_argument("--profile", help="reuse a saved measurement setup")
+    setup_input.add_argument("--from-capture", type=Path, help="reuse metadata from an existing capture directory or capture.json")
+    parser.add_argument("--profiles", action="store_true", help="list saved setups and exit")
+    parser.add_argument("--save-profile", metavar="NAME", help="save these settings and exit without connecting hardware")
+    parser.add_argument("--setup", action="store_true", help="choose/edit a saved setup interactively before capture")
+    parser.add_argument("--source-name", default="", help="readable source filename label")
+    parser.add_argument("--cable-name", default="", help="readable cable filename label")
+    parser.add_argument("--measurement-condition", default="pd-interrogate", help="measurement condition in log filenames")
+    parser.add_argument("--firmware-version", default="", help="firmware revision used for this capture")
+    parser.add_argument("--board-revision", default="", help="board revision or modification")
+    parser.add_argument("--cc-resistance", default="", help="CC resistor configuration, for example external-5.1k")
+    parser.add_argument("--orientation", default="", help="connector orientation, for example omote/ura")
+    parser.add_argument("--test-note", default="", help="free-form measurement note")
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("--source-id", default="", help="stable source identifier")
     source_group.add_argument(
@@ -873,8 +958,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-model", default="", help="source model")
     parser.add_argument(
         "--source-port",
-        default="",
-        help="source connection port, for example C1",
+        default="C1",
+        help="source connection port (default: C1)",
     )
     parser.add_argument("--cable-manufacturer", default="", help="cable manufacturer")
     parser.add_argument("--cable-model", default="", help="cable model")
@@ -900,26 +985,132 @@ def build_parser() -> argparse.ArgumentParser:
         default=50.0,
         help="input AC frequency in hertz (default: 50)",
     )
-    parser.add_argument("--verbose", action="store_true", help="echo all firmware debug lines")
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "--verbose",
+        dest="verbose",
+        action="store_true",
+        default=True,
+        help="echo all firmware debug lines (default)",
+    )
+    output_group.add_argument(
+        "--quiet",
+        dest="verbose",
+        action="store_false",
+        help="show only completed or updated summaries",
+    )
     parser.add_argument("--list", action="store_true", help="list serial ports and exit")
     parser.add_argument("--replay", type=Path, help="parse a saved UART log instead of a COM port")
     return parser
 
 
+def validate_setup(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    for field, flag in (("input_ac_voltage_v", "--input-ac-voltage"),
+                        ("input_ac_frequency_hz", "--input-ac-frequency")):
+        value = getattr(args, field)
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            parser.error(f"{flag} must be finite and greater than zero")
+    if args.cable_length_m is not None and (
+        not isinstance(args.cable_length_m, (int, float))
+        or not math.isfinite(args.cable_length_m) or args.cable_length_m < 0
+    ):
+        parser.error("--cable-length-m must be finite and zero or greater")
+    if args.cable_attachment not in {"unknown", "detachable", "captive"}:
+        parser.error("invalid cable attachment in saved setup")
+
+
+def interactive_setup(parser: argparse.ArgumentParser, args: argparse.Namespace) -> bool:
+    profiles = list_profiles(args.output)
+    previous = last_profile(args.output)
+    print("Saved measurement setups:")
+    for index, entry in enumerate(profiles, 1):
+        print(f"  {index}: {entry['name']}" + (" (last used)" if entry['name'] == previous else ""))
+    print("  0: New setup")
+    default = next((str(i) for i, entry in enumerate(profiles, 1) if entry['name'] == previous), "0")
+    choice = input(f"Setup [{default}]: ").strip() or default
+    if not choice.isdigit() or not 0 <= int(choice) <= len(profiles):
+        parser.error("Choose one of the displayed setup numbers")
+    name = ""
+    if int(choice):
+        selected = profiles[int(choice) - 1]
+        name = str(selected['name'])
+        for field, value in selected['metadata'].items():
+            if field in PROFILE_FIELDS:
+                setattr(args, field, value)
+    edit_fields = PROFILE_FIELDS if not name or input("Edit the saved settings? [y/N]: ").strip().lower() == "y" else ()
+    for field in edit_fields:
+        current = getattr(args, field)
+        entered = input(f"{field.replace('_', ' ')} [{'' if current is None else current}] (Enter=keep, -=clear): ").strip()
+        if not entered:
+            continue
+        if field in {"cable_length_m", "input_ac_voltage_v", "input_ac_frequency_hz"}:
+            try:
+                value = None if entered == "-" and field == "cable_length_m" else float(entered)
+            except ValueError:
+                parser.error(f"{field} must be numeric")
+        else:
+            value = "" if entered == "-" else entered
+        setattr(args, field, value)
+    validate_setup(parser, args)
+    name = input(f"Save setup as [{name}]: ").strip() or name
+    if not name:
+        parser.error("A setup name is required")
+    save_profile(args.output, name, vars(args))
+    print(f"Saved setup: {name}")
+    print(json.dumps({key: getattr(args, key) for key in PROFILE_FIELDS}, ensure_ascii=False, indent=2))
+    return input("Start capture with these settings? [y/N]: ").strip().lower() == "y"
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.input_ac_voltage_v <= 0:
-        parser.error("--input-ac-voltage must be greater than zero")
-    if args.input_ac_frequency_hz <= 0:
-        parser.error("--input-ac-frequency must be greater than zero")
-    if args.cable_length_m is not None and args.cable_length_m < 0:
-        parser.error("--cable-length-m must be zero or greater")
+    arguments = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(arguments)
+    if args.from_capture:
+        metadata_path = args.from_capture / "capture.json" if args.from_capture.is_dir() else args.from_capture
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict) or metadata.get("format") != "PD_CAPTURE_1":
+                raise ValueError("Expected a CH32 capture.json file")
+            parser.set_defaults(**{key: metadata[key] for key in PROFILE_FIELDS if key in metadata})
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        args = parser.parse_args(arguments)
+    if args.profile:
+        try:
+            parser.set_defaults(**load_profile(args.output, args.profile))
+        except ValueError as exc:
+            parser.error(str(exc))
+        args = parser.parse_args(arguments)
+    validate_setup(parser, args)
+    if args.profiles:
+        for entry in list_profiles(args.output):
+            print(f"{entry['name']}\t{entry['metadata'].get('source_id', '')}\t{entry['metadata'].get('cable_id', '')}")
+        return 0
+    if args.save_profile:
+        save_profile(args.output, args.save_profile, vars(args))
+        print(f"Saved setup: {args.save_profile} (no hardware connected)")
+        return 0
+    if args.setup and not interactive_setup(parser, args):
+        return 0
+    if args.setup:
+        args.profile = None
     if args.list:
         for port in available_ports():
             print(f"{port.device}\t{port.description}\tVID={getattr(port, 'vid', None)!r}")
         return 0
 
+    # Validate the input before creating an otherwise empty capture directory.
+    if args.replay:
+        if not args.replay.is_file():
+            parser.error(f"Replay log not found: {args.replay}")
+        capture_port = None
+    else:
+        if serial is None:
+            parser.error("pyserial is required: python -m pip install pyserial")
+        capture_port = choose_port(args.port)
+    if args.profile:
+        # Remember the chosen profile without persisting one-off CLI overrides.
+        save_profile(args.output, args.profile, load_profile(args.output, args.profile))
     capture = CaptureRun(
         args.output,
         source_id=args.source_id,
@@ -934,13 +1125,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         input_ac_voltage_v=args.input_ac_voltage_v,
         input_ac_frequency_hz=args.input_ac_frequency_hz,
         verbose=args.verbose,
+        **{key: getattr(args, key) for key in (
+            "source_name", "cable_name", "measurement_condition", "firmware_version",
+            "board_revision", "cc_resistance", "orientation", "test_note",
+        )},
     )
     print(f"Capture directory: {capture.root.resolve()}")
     try:
         if args.replay:
             replay(args.replay, capture)
         else:
-            capture_serial(choose_port(args.port), args.baud, capture)
+            capture_serial(capture_port, args.baud, capture)
     except KeyboardInterrupt:
         print("\nCapture stopped.")
     finally:

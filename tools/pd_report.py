@@ -5,17 +5,30 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
+import sqlite3
+import hashlib
 import html
 import json
+import os
 import re
+import socket
 import sys
-from datetime import datetime
+import threading
+import uuid
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
+from pd_store import index_rows, history, DATABASE_NAME
 
 
 DEFAULT_CAPTURES = Path(__file__).resolve().parent.parent / "captures"
+ANNOTATIONS_FILE = "result_annotations.json"
+ANNOTATIONS_LOCK = threading.Lock()
+RESULT_ID_RE = re.compile(r"^ch32h417:[A-Za-z0-9._-]{8,96}$")
 
 
 CAPTURE_RE = re.compile(
@@ -35,6 +48,66 @@ VALID_STATUS = {
     "rejected",
     "invalid",
 }
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(text, encoding="utf-8", newline="")
+    try:
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def annotations_path(captures: Path) -> Path:
+    return captures / ANNOTATIONS_FILE
+
+
+def load_annotations(captures: Path) -> dict[str, object]:
+    path = annotations_path(captures)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"schema_version": 1, "results": {}}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {"schema_version": 1, "results": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("results"), dict):
+        return {"schema_version": 1, "results": {}}
+    return data
+
+
+def save_favorite(captures: Path, result_id: str, favorite: bool) -> dict[str, object]:
+    if not RESULT_ID_RE.fullmatch(result_id):
+        raise ValueError("invalid result_id")
+    with ANNOTATIONS_LOCK:
+        data = load_annotations(captures)
+        results = data.setdefault("results", {})
+        if not isinstance(results, dict):
+            results = {}
+            data["results"] = results
+        if favorite:
+            current = results.get(result_id, {})
+            entry = dict(current) if isinstance(current, dict) else {}
+            entry.update(
+                {
+                    "favorite": True,
+                    "updated_at": datetime.now(timezone.utc).astimezone().isoformat(
+                        timespec="seconds"
+                    ),
+                }
+            )
+            results[result_id] = entry
+        else:
+            results.pop(result_id, None)
+        data["schema_version"] = 1
+        atomic_write_text(
+            annotations_path(captures),
+            json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        )
+        return data
 
 
 def as_int(value: object, default: int = 0) -> int:
@@ -549,7 +622,38 @@ def cable_raw_text(cable: dict[str, object]) -> str:
     return "; ".join(values) or "Not recorded"
 
 
-def make_row(result_path: Path, captures: Path) -> dict[str, str]:
+def result_id_for(result_path: Path, data: dict[str, object]) -> str:
+    explicit = str(data.get("result_id") or "").strip()
+    if RESULT_ID_RE.fullmatch(explicit):
+        return explicit
+    captured, _ = capture_details(result_path)
+    identity = {
+        "captured": captured,
+        "capture": result_path.parent.parent.name,
+        "session": data.get("session"),
+        "firmware_session": data.get("firmware_session"),
+        "source_id": data.get("source_id"),
+        "result": data,
+    }
+    encoded = json.dumps(
+        identity, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return "ch32h417:" + hashlib.sha256(encoded).hexdigest()[:32]
+
+
+def result_status(overall: str) -> tuple[str, str]:
+    if overall == "PASS":
+        return "valid", "Valid"
+    if overall == "FAIL":
+        return "failed", "Failed"
+    return "review", "Review"
+
+
+def make_row(
+    result_path: Path,
+    captures: Path,
+    annotations: dict[str, object] | None = None,
+) -> dict[str, str]:
     data = json.loads(result_path.read_text(encoding="utf-8"))
     source = data.get("source", {})
     source_summary = source.get("summary", {}) if isinstance(source, dict) else {}
@@ -559,6 +663,7 @@ def make_row(result_path: Path, captures: Path) -> dict[str, str]:
     cable = effective_cable(data)
     protocol = data.get("protocol", {})
     captured, _ = capture_details(result_path)
+    metadata = capture_metadata(result_path)
     source_id, cable_id = capture_ids(result_path, data, cable)
     attachment = cable_attachment(result_path, data, cable_id)
 
@@ -592,6 +697,15 @@ def make_row(result_path: Path, captures: Path) -> dict[str, str]:
 
     issues: list[str] = []
     overall = str(data.get("overall", "PARTIAL")).upper()
+    status_key, status_label = result_status(overall)
+    result_id = result_id_for(result_path, data)
+    annotation_results = (annotations or {}).get("results", {})
+    annotation = (
+        annotation_results.get(result_id, {})
+        if isinstance(annotation_results, dict)
+        else {}
+    )
+    favorite = bool(annotation.get("favorite")) if isinstance(annotation, dict) else False
     if overall != "PASS":
         issues.append("Measurement incomplete")
     for key in ("spr", "pps", "epr", "chunk"):
@@ -605,8 +719,21 @@ def make_row(result_path: Path, captures: Path) -> dict[str, str]:
 
     relative_session = result_path.parent.relative_to(captures)
     link_base = quote(relative_session.as_posix(), safe="/")
+    artifacts = data.get("artifacts", {})
+    raw_name = str(artifacts.get("raw_log") or "raw.log") if isinstance(artifacts, dict) else "raw.log"
+    if Path(raw_name).name != raw_name or "/" in raw_name or "\\" in raw_name:
+        raw_name = "raw.log"
     return {
+        "Result ID": result_id,
+        "Result Status": status_label,
+        "Favorite": "Yes" if favorite else "No",
         "Captured": captured,
+        "Source Manufacturer": str(metadata.get("source_manufacturer") or ""),
+        "Source Model": str(metadata.get("source_model") or ""),
+        "Source Port": str(metadata.get("source_port") or ""),
+        "Cable Manufacturer": str(metadata.get("cable_manufacturer") or ""),
+        "Cable Model": str(metadata.get("cable_model") or ""),
+        "Cable Length m": str(metadata.get("cable_length_m") or ""),
         "Source ID": source_id,
         "Cable ID": cable_id,
         "Cable Attachment": attachment.capitalize(),
@@ -648,14 +775,31 @@ def make_row(result_path: Path, captures: Path) -> dict[str, str]:
         "EPR exit": exit_text(protocol.get("exit")),
         "Detached": "Yes" if bool(data.get("detached")) else "No",
         "Notes": "; ".join(dict.fromkeys(issues)) or "None",
+        "Measurement Condition": str(metadata.get("measurement_condition") or ""),
+        "Firmware Version": str(metadata.get("firmware_version") or ""),
+        "Board Revision": str(metadata.get("board_revision") or ""),
+        "CC Resistance": str(metadata.get("cc_resistance") or ""),
+        "Orientation": str(metadata.get("orientation") or ""),
+        "Test Note": str(metadata.get("test_note") or ""),
+        "Capture ID": str(metadata.get("capture_id") or ""),
+        "Raw Log": f"{relative_session.as_posix()}/{raw_name}",
         "_summary": f"{link_base}/summary.txt",
         "_result": f"{link_base}/result.json",
-        "_raw": f"{link_base}/raw.log",
+        "_raw": f"{link_base}/{quote(raw_name, safe='')}",
     }
 
 
 CSV_FIELDS = [
+    "Result ID",
+    "Result Status",
+    "Favorite",
     "Captured",
+    "Source Manufacturer",
+    "Source Model",
+    "Source Port",
+    "Cable Manufacturer",
+    "Cable Model",
+    "Cable Length m",
     "Source ID",
     "Cable ID",
     "Cable Attachment",
@@ -693,14 +837,17 @@ CSV_FIELDS = [
     "EPR exit",
     "Detached",
     "Notes",
+    "Measurement Condition", "Firmware Version", "Board Revision", "CC Resistance",
+    "Orientation", "Test Note", "Capture ID", "Raw Log",
 ]
 
 
 def discover_rows(captures: Path) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
+    annotations = load_annotations(captures)
     for result_path in captures.glob("*/session_*/result.json"):
         try:
-            rows.append(make_row(result_path, captures))
+            rows.append(make_row(result_path, captures, annotations))
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             print(f"Skipping {result_path}: {exc}", file=sys.stderr)
     rows.sort(key=lambda row: (row["Captured"], as_int(row["Session"])), reverse=True)
@@ -708,10 +855,11 @@ def discover_rows(captures: Path) -> list[dict[str, str]]:
 
 
 def write_csv(path: Path, rows: list[dict[str, str]]) -> None:
-    with path.open("w", encoding="utf-8-sig", newline="") as output:
+    with io.StringIO(newline="") as output:
         writer = csv.DictWriter(output, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+        atomic_write_text(path, "\ufeff" + output.getvalue())
 
 
 SOURCE_CSV_FIELDS = [
@@ -839,10 +987,11 @@ def discover_source_rows(session_rows: list[dict[str, str]]) -> list[dict[str, o
 
 
 def write_source_csv(path: Path, rows: list[dict[str, object]]) -> None:
-    with path.open("w", encoding="utf-8-sig", newline="") as output:
+    with io.StringIO(newline="") as output:
         writer = csv.DictWriter(output, fieldnames=SOURCE_CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+        atomic_write_text(path, "\ufeff" + output.getvalue())
 
 
 PDO_CSV_FIELDS = [
@@ -973,10 +1122,11 @@ def discover_pdo_rows(captures: Path) -> list[dict[str, object]]:
 
 
 def write_pdo_csv(path: Path, rows: list[dict[str, object]]) -> None:
-    with path.open("w", encoding="utf-8-sig", newline="") as output:
+    with io.StringIO(newline="") as output:
         writer = csv.DictWriter(output, fieldnames=PDO_CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+        atomic_write_text(path, "\ufeff" + output.getvalue())
 
 
 CABLE_CSV_FIELDS = [
@@ -1083,15 +1233,29 @@ def discover_cable_rows(captures: Path) -> list[dict[str, object]]:
 
 
 def write_cable_csv(path: Path, rows: list[dict[str, object]]) -> None:
-    with path.open("w", encoding="utf-8-sig", newline="") as output:
+    with io.StringIO(newline="") as output:
         writer = csv.DictWriter(output, fieldnames=CABLE_CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+        atomic_write_text(path, "\ufeff" + output.getvalue())
 
 
-def html_cell(value: str, class_name: str = "") -> str:
+def html_cell(
+    value: str,
+    class_name: str = "",
+    *,
+    break_after_semicolon: bool = False,
+    show_full_value: bool = False,
+) -> str:
     class_attr = f' class="{class_name}"' if class_name else ""
-    return f"<td{class_attr}>{html.escape(value)}</td>"
+    title_attr = f' title="{html.escape(value, quote=True)}"' if show_full_value else ""
+    if break_after_semicolon:
+        content = ";<br>".join(
+            html.escape(part.strip()) for part in re.split(r";\s*", value)
+        )
+    else:
+        content = html.escape(value)
+    return f"<td{class_attr}{title_attr}>{content}</td>"
 
 
 def write_html(path: Path, rows: list[dict[str, str]]) -> None:
@@ -1099,6 +1263,9 @@ def write_html(path: Path, rows: list[dict[str, str]]) -> None:
     for row in rows:
         overall = row["Overall"]
         status_class = "pass" if overall == "PASS" else "fail" if overall == "FAIL" else "partial"
+        result_status = row["Result Status"].lower()
+        result_id = row["Result ID"]
+        favorite = row["Favorite"] == "Yes"
         links = (
             f'<a href="{row["_summary"]}">Summary</a> '
             f'<a href="{row["_result"]}">JSON</a> '
@@ -1106,46 +1273,55 @@ def write_html(path: Path, rows: list[dict[str, str]]) -> None:
         )
         search = html.escape(" ".join(row[field] for field in CSV_FIELDS).lower(), quote=True)
         cells = [
-            html_cell(row["Captured"]),
-            html_cell(row["Source ID"], "label"),
-            html_cell(row["Cable ID"], "label"),
-            html_cell(row["Cable Attachment"]),
-            html_cell(row["Overall"], f"status {status_class}"),
-            html_cell(row["SPR"]),
-            html_cell(row["PPS"]),
+            (
+                '<td class="favorite-cell">'
+                f'<button class="favorite" type="button" data-result-id="{html.escape(result_id, quote=True)}" '
+                f'aria-pressed="{str(favorite).lower()}" title="{("Remove from" if favorite else "Add to")} favorites">'
+                f'{"★" if favorite else "☆"}</button></td>'
+            ),
+            html_cell(result_id, "result-id", show_full_value=True),
+            html_cell(row["Captured"], "compact"),
+            html_cell(row["Source ID"], "identifier source-id", show_full_value=True),
+            html_cell(row["Cable ID"], "identifier cable-id", show_full_value=True),
+            html_cell(row["Cable Attachment"], "compact"),
+            html_cell(row["Result Status"], f"result-status {result_status} compact"),
+            html_cell(row["Overall"], f"status {status_class} compact"),
+            html_cell(row["SPR"], "compact"),
+            html_cell(row["PPS"], "compact"),
             html_cell(row["SPR AVS"]),
-            html_cell(row["EPR fixed"]),
-            html_cell(row["AVS"]),
-            html_cell(row["PDP"]),
+            html_cell(row["EPR fixed"], "compact"),
+            html_cell(row["AVS"], "compact"),
+            html_cell(row["PDP"], "compact"),
             html_cell(row["Power/data roles"]),
-            html_cell(row["Source flags"], "notes"),
-            html_cell(row["SPR PDO details"], "notes"),
-            html_cell(row["SPR PDO raw"], "notes"),
-            html_cell(row["EPR PDO details"], "notes"),
-            html_cell(row["EPR PDO raw"], "notes"),
+            html_cell(row["Source flags"], "notes", break_after_semicolon=True),
+            html_cell(row["SPR PDO details"], "detail-list", break_after_semicolon=True),
+            html_cell(row["SPR PDO raw"], "raw-list", break_after_semicolon=True),
+            html_cell(row["EPR PDO details"], "detail-list", break_after_semicolon=True),
+            html_cell(row["EPR PDO raw"], "raw-list", break_after_semicolon=True),
             html_cell(row["Source identity"]),
-            html_cell(row["Source identity raw"], "notes"),
-            html_cell(row["PD revision"]),
+            html_cell(row["Source identity raw"], "raw-list", break_after_semicolon=True),
+            html_cell(row["PD revision"], "compact"),
             html_cell(row["Extended identity"]),
             html_cell(row["Source info"]),
             html_cell(row["Manufacturer"]),
-            html_cell(row["Probe support"], "notes"),
-            html_cell(row["Probe details"], "notes"),
+            html_cell(row["Probe support"], "detail-list", break_after_semicolon=True),
+            html_cell(row["Probe details"], "detail-list", break_after_semicolon=True),
             html_cell(row["Cable"]),
             html_cell(row["Cable observation"], "observation"),
-            html_cell(row["Cable VID"]),
-            html_cell(row["Cable raw"], "notes"),
-            html_cell(row["SPR contract"]),
-            html_cell(row["PPS probe"]),
-            html_cell(row["EPR enter"]),
-            html_cell(row["Chunking"]),
-            html_cell(row["EPR exit"]),
-            html_cell(row["Detached"]),
-            html_cell(row["Notes"], "notes"),
+            html_cell(row["Cable VID"], "compact"),
+            html_cell(row["Cable raw"], "raw-list", break_after_semicolon=True),
+            html_cell(row["SPR contract"], "compact"),
+            html_cell(row["PPS probe"], "compact"),
+            html_cell(row["EPR enter"], "compact"),
+            html_cell(row["Chunking"], "compact"),
+            html_cell(row["EPR exit"], "compact"),
+            html_cell(row["Detached"], "compact"),
+            html_cell(row["Notes"], "detail-list", break_after_semicolon=True),
             f'<td class="files">{links}</td>',
         ]
         body.append(
-            f'<tr data-overall="{html.escape(overall)}" data-search="{search}">'
+            f'<tr data-result-status="{html.escape(result_status)}" '
+            f'data-favorite="{str(favorite).lower()}" data-search="{search}">'
             + "".join(cells)
             + "</tr>"
         )
@@ -1165,30 +1341,49 @@ header {{ padding: 18px 24px 12px; border-bottom: 1px solid #c9ced6; background:
 h1 {{ margin: 0 0 5px; font-size: 22px; letter-spacing: 0; }}
 .meta {{ color: #5d6672; font-size: 13px; }}
 .meta a {{ margin-left: 10px; color: #0969b5; }}
-.controls {{ display: flex; gap: 10px; align-items: center; padding: 12px 24px; background: #e9edf2; border-bottom: 1px solid #c9ced6; }}
-input, select {{ min-height: 34px; padding: 6px 9px; border: 1px solid #aeb6c1; border-radius: 4px; background: #fff; color: #20242a; }}
+.controls {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 12px 24px; background: #e9edf2; border-bottom: 1px solid #c9ced6; }}
+input, button {{ min-height: 34px; padding: 6px 9px; border: 1px solid #aeb6c1; border-radius: 4px; background: #fff; color: #20242a; }}
 input {{ width: min(460px, 55vw); }}
+.filter-button[aria-pressed="true"] {{ border-color: #1f6f64; background: #dff1ed; color: #12544c; font-weight: 700; }}
+.filter-count {{ display: inline-block; min-width: 22px; margin-left: 5px; padding: 1px 5px; border-radius: 10px; background: #e5e9ee; font-size: 11px; text-align: center; }}
+.filter-button[aria-pressed="true"] .filter-count {{ background: #fff; }}
 #count {{ margin-left: auto; color: #5d6672; font-size: 13px; }}
 .table-wrap {{ overflow: auto; height: calc(100vh - 137px); }}
 table {{ width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; background: #fff; font-size: 13px; }}
 th {{ position: sticky; top: 34px; z-index: 2; padding: 8px 9px; text-align: left; white-space: nowrap; background: #343b45; color: #fff; border-right: 1px solid #59616d; }}
 thead .group th {{ top: 0; z-index: 3; background: #1f6f64; text-align: center; font-size: 12px; letter-spacing: .02em; }}
-td {{ max-width: 270px; padding: 7px 9px; border-right: 1px solid #d9dde3; border-bottom: 1px solid #d9dde3; vertical-align: top; white-space: nowrap; }}
+td {{ max-width: 270px; padding: 7px 9px; border-right: 1px solid #d9dde3; border-bottom: 1px solid #d9dde3; vertical-align: top; white-space: normal; overflow-wrap: anywhere; word-break: normal; line-height: 1.35; }}
 tbody tr:nth-child(even) {{ background: #f7f8fa; }}
 tbody tr:hover {{ background: #e8f1fb; }}
-.label {{ font-weight: 650; }}
+.compact {{ white-space: nowrap; overflow-wrap: normal; }}
+.identifier {{ min-width: 170px; max-width: 260px; font-weight: 650; overflow-wrap: anywhere; word-break: break-word; }}
+.source-id {{ min-width: 180px; }}
+.cable-id {{ min-width: 220px; }}
 .status {{ font-weight: 750; }}
 .status.pass {{ color: #08783e; }}
 .status.partial {{ color: #986300; }}
 .status.fail {{ color: #b42318; }}
+.result-status {{ font-weight: 750; }}
+.result-status.valid {{ color: #08783e; }}
+.result-status.review {{ color: #986300; }}
+.result-status.failed {{ color: #b42318; }}
+.favorite-cell {{ padding: 3px 6px; text-align: center; }}
+.favorite {{ min-height: 28px; padding: 1px 7px; border-color: transparent; background: transparent; color: #8b6b00; cursor: pointer; font-size: 20px; line-height: 1; }}
+.favorite:hover {{ border-color: #c99c00; }}
+.favorite[aria-pressed="true"] {{ color: #c28b00; }}
+.result-id {{ max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; font-family: Consolas, monospace; font-size: 11px; }}
 .notes {{ white-space: normal; min-width: 190px; }}
+.detail-list {{ min-width: 230px; white-space: normal; }}
+.raw-list {{ min-width: 220px; white-space: normal; font-family: Consolas, monospace; font-size: 11px; }}
 .observation {{ color: #5d6672; font-style: italic; }}
+.files {{ white-space: nowrap; overflow-wrap: normal; }}
 .files a {{ margin-right: 8px; color: #0969b5; }}
 @media (prefers-color-scheme: dark) {{
   body, table {{ background: #17191d; color: #e6e9ed; }}
   header {{ background: #20242a; border-color: #444b55; }}
   .controls {{ background: #282d34; border-color: #444b55; }}
-  input, select {{ background: #17191d; color: #e6e9ed; border-color: #59616d; }}
+  input, button {{ background: #17191d; color: #e6e9ed; border-color: #59616d; }}
+  .filter-button[aria-pressed="true"] {{ background: #214d47; color: #e6e9ed; }}
   th {{ background: #30363e; }}
   td {{ border-color: #3b414a; }}
   tbody tr:nth-child(even) {{ background: #1d2025; }}
@@ -1196,6 +1391,9 @@ tbody tr:hover {{ background: #e8f1fb; }}
   .status.pass {{ color: #56d38b; }}
   .status.partial {{ color: #f0bd54; }}
   .status.fail {{ color: #ff8177; }}
+  .result-status.valid {{ color: #56d38b; }}
+  .result-status.review {{ color: #f0bd54; }}
+  .result-status.failed {{ color: #ff8177; }}
   .observation {{ color: #aeb6c1; }}
   .files a {{ color: #75bfff; }}
 }}
@@ -1213,26 +1411,25 @@ tbody tr:hover {{ background: #e8f1fb; }}
 </header>
 <div class="controls">
   <input id="search" type="search" placeholder="Filter by source ID, cable ID, PDO, VID, status..." aria-label="Filter measurements">
-  <select id="overall" aria-label="Overall result">
-    <option value="">All results</option>
-    <option value="PASS">PASS</option>
-    <option value="PARTIAL">PARTIAL</option>
-    <option value="FAIL">FAIL</option>
-  </select>
+  <button class="filter-button" type="button" data-status-filter="valid" aria-pressed="true">Valid <span class="filter-count" data-filter-count>0</span></button>
+  <button class="filter-button" type="button" data-status-filter="failed" aria-pressed="false">Failed <span class="filter-count" data-filter-count>0</span></button>
+  <button class="filter-button" type="button" data-status-filter="review" aria-pressed="false">Review <span class="filter-count" data-filter-count>0</span></button>
+  <button class="filter-button" type="button" data-status-filter="all" aria-pressed="false">All <span class="filter-count" data-filter-count>0</span></button>
+  <button id="favorites" class="filter-button" type="button" aria-pressed="false">★ Favorites <span class="filter-count" id="favorite-count">0</span></button>
   <span id="count"></span>
 </div>
 <div class="table-wrap">
 <table>
 <thead>
   <tr class="group">
-    <th colspan="4">Capture context</th><th colspan="1">Result</th>
+    <th colspan="6">Capture context</th><th colspan="2">Result</th>
     <th colspan="12">Core negotiated source capabilities</th>
     <th colspan="8">Optional source probes</th>
     <th colspan="4">Passive SOP′ cable observation</th>
     <th colspan="8">Protocol outcome</th>
   </tr>
 <tr>
-  <th>Captured</th><th>Source ID</th><th>Cable ID</th><th>Cable Attachment</th><th>Overall</th><th>SPR</th><th>PPS</th><th>SPR AVS</th>
+  <th>Favorite</th><th>Result ID</th><th>Captured</th><th>Source ID</th><th>Cable ID</th><th>Cable Attachment</th><th>Result Status</th><th>Overall</th><th>SPR</th><th>PPS</th><th>SPR AVS</th>
   <th>EPR Fixed</th><th>AVS</th><th>PDP</th><th>Power/Data Roles</th>
   <th>Source Flags</th><th>SPR PDO Details</th><th>SPR PDO Raw</th>
   <th>EPR PDO Details</th><th>EPR PDO Raw</th><th>Source Identity</th>
@@ -1249,22 +1446,75 @@ tbody tr:hover {{ background: #e8f1fb; }}
 </div>
 <script>
 const search = document.getElementById('search');
-const overall = document.getElementById('overall');
 const rows = Array.from(document.querySelectorAll('tbody tr'));
 const count = document.getElementById('count');
+const statusButtons = Array.from(document.querySelectorAll('[data-status-filter]'));
+const favorites = document.getElementById('favorites');
+const favoriteCount = document.getElementById('favorite-count');
+let statusFilter = 'valid';
+let favoritesOnly = false;
 function filterRows() {{
   const query = search.value.trim().toLowerCase();
+  const searchMatches = rows.filter((row) => !query || row.dataset.search.includes(query));
+  for (const button of statusButtons) {{
+    const filter = button.dataset.statusFilter;
+    const matches = filter === 'all'
+      ? searchMatches.length
+      : searchMatches.filter((row) => row.dataset.resultStatus === filter).length;
+    button.setAttribute('aria-pressed', String(filter === statusFilter));
+    button.querySelector('[data-filter-count]').textContent = String(matches);
+  }}
+  const statusMatches = searchMatches.filter((row) =>
+    statusFilter === 'all' || row.dataset.resultStatus === statusFilter
+  );
+  favoriteCount.textContent = String(statusMatches.filter((row) => row.dataset.favorite === 'true').length);
+  favorites.setAttribute('aria-pressed', String(favoritesOnly));
   let visible = 0;
   for (const row of rows) {{
-    const show = (!query || row.dataset.search.includes(query)) &&
-      (!overall.value || row.dataset.overall === overall.value);
+    const show = statusMatches.includes(row) && (!favoritesOnly || row.dataset.favorite === 'true');
     row.hidden = !show;
     if (show) visible++;
   }}
   count.textContent = `${{visible}} / ${{rows.length}} sessions`;
 }}
 search.addEventListener('input', filterRows);
-overall.addEventListener('change', filterRows);
+for (const button of statusButtons) {{
+  button.addEventListener('click', () => {{
+    statusFilter = button.dataset.statusFilter;
+    filterRows();
+  }});
+}}
+favorites.addEventListener('click', () => {{
+  favoritesOnly = !favoritesOnly;
+  filterRows();
+}});
+for (const button of document.querySelectorAll('.favorite')) {{
+  button.addEventListener('click', async () => {{
+    if (location.protocol === 'file:') {{
+      alert('Start this viewer with pd_report.py --serve to save favorites.');
+      return;
+    }}
+    const favorite = button.getAttribute('aria-pressed') !== 'true';
+    button.disabled = true;
+    try {{
+      const response = await fetch('/api/favorite', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{result_id: button.dataset.resultId, favorite}}),
+      }});
+      if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
+      button.setAttribute('aria-pressed', String(favorite));
+      button.textContent = favorite ? '★' : '☆';
+      button.title = favorite ? 'Remove from favorites' : 'Add to favorites';
+      button.closest('tr').dataset.favorite = String(favorite);
+      filterRows();
+    }} catch (error) {{
+      alert(`Could not save favorite: ${{error}}`);
+    }} finally {{
+      button.disabled = false;
+    }}
+  }});
+}}
 filterRows();
 </script>
 </body>
@@ -1286,12 +1536,133 @@ def generate_reports(captures: Path) -> tuple[Path, Path, int]:
     write_pdo_csv(pdo_csv_path, discover_pdo_rows(captures))
     write_cable_csv(cable_csv_path, discover_cable_rows(captures))
     write_html(html_path, rows)
+    try:
+        index_rows(captures, rows)
+    except (sqlite3.Error, OSError) as exc:
+        print(f"Warning: CSV reports saved, but measurement index could not be updated: {exc}", file=sys.stderr)
     return html_path, csv_path, len(rows)
 
 
+def make_report_handler(captures: Path) -> type[SimpleHTTPRequestHandler]:
+    class ReportHandler(SimpleHTTPRequestHandler):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, directory=str(captures), **kwargs)
+
+        def send_json(
+            self, value: object, status: HTTPStatus = HTTPStatus.OK
+        ) -> None:
+            body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def local_client(self) -> bool:
+            return self.client_address[0] in {"127.0.0.1", "::1"}
+
+        def do_GET(self) -> None:
+            request_path = unquote(urlparse(self.path).path)
+            if request_path in {"", "/"}:
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", "/spec_table.html")
+                self.end_headers()
+                return
+            if request_path == "/api/annotations":
+                self.send_json(load_annotations(captures))
+                return
+            super().do_GET()
+
+        def do_POST(self) -> None:
+            request_path = unquote(urlparse(self.path).path)
+            if request_path != "/api/favorite":
+                self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                return
+            if not self.local_client():
+                self.send_json({"error": "localhost only"}, HTTPStatus.FORBIDDEN)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON body must be an object")
+                result_id = str(payload.get("result_id") or "")
+                favorite = payload.get("favorite")
+                if not isinstance(favorite, bool):
+                    raise ValueError("favorite must be true or false")
+                data = save_favorite(captures, result_id, favorite)
+                # Keep generated CSV/HTML as a portable projection of the
+                # annotation registry for downstream ASD-PD31 imports.
+                generate_reports(captures)
+                self.send_json(
+                    {
+                        "result_id": result_id,
+                        "favorite": favorite,
+                        "updated": data.get("results", {}).get(result_id, {}),
+                    }
+                )
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except OSError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    return ReportHandler
+
+
+class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """Prevent Windows SO_REUSEADDR from sharing a viewer port silently."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def serve_reports(captures: Path, host: str, port: int) -> None:
+    try:
+        server = ExclusiveThreadingHTTPServer(
+            (host, port), make_report_handler(captures)
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not start CH32H417 results viewer on {host}:{port}; "
+            "the port is already in use. Stop the other viewer or choose "
+            f"another port with --port (for example, --port {port + 1})."
+        ) from exc
+    print(f"CH32H417 results viewer: http://{host}:{port}/")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping results viewer.")
+    finally:
+        server.server_close()
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  python tools/pd_report.py --history --source-id adapter-01
+  python tools/pd_report.py --history --cable-id cable-01 --limit 100
+  python tools/pd_report.py --serve --port 8766
+
+Rebuilds CSV/HTML exports and the SQLite session index from old and new captures.
+Preserves saved profiles, result IDs, and favorites; no hardware is required.
+Point the dashboard's ch32_capture_root at this folder containing spec_table.csv.
+Back up the entire captures folder, including measurements.sqlite3 (profiles)
+and result_annotations.json (favorites), as well as the original logs and JSON.
+""",
+    )
     parser.add_argument("--captures", type=Path, default=DEFAULT_CAPTURES)
+    parser.add_argument("--serve", action="store_true", help="serve the report and enable persistent favorites")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--history", action="store_true", help="print indexed measurement history after refreshing reports")
+    parser.add_argument("--source-id", default="", help="filter --history by physical source ID")
+    parser.add_argument("--cable-id", default="", help="filter --history by physical cable ID")
+    parser.add_argument("--limit", type=int, default=50, help="maximum history rows")
     return parser
 
 
@@ -1304,6 +1675,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     print(f"Wrote {args.captures.resolve() / 'pdo_table.csv'}")
     print(f"Wrote {args.captures.resolve() / 'cable_table.csv'}")
     print(f"Sessions: {count}")
+    print(f"Index: {args.captures.resolve() / DATABASE_NAME}")
+    if args.history:
+        for row in history(args.captures.resolve(), args.source_id, args.cable_id, args.limit):
+            print(f"{row['Captured']}\t{row['Source ID']}\t{row['Cable ID']}\t{row['Result Status']}\t{row['Result ID']}\t{row.get('Firmware Version', '')}\t{row.get('Test Note', '')}")
+    if args.serve:
+        try:
+            serve_reports(args.captures.resolve(), args.host, args.port)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
     return 0
 
 
