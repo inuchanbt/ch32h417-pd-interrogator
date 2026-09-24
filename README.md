@@ -1,5 +1,7 @@
 # CH32H417 PD Interrogator
 
+English | [日本語](README.ja.md)
+
 USB Power Delivery sink and protocol interrogator firmware for the WCH
 CH32H417. It negotiates a safe 5 V contract, enumerates SPR/PPS capabilities,
 enters EPR mode when supported, reconstructs chunked EPR Source Capabilities,
@@ -229,3 +231,10 @@ VCONN Swap or SOP' requests that could interfere with source-to-cable traffic.
 
 This configuration expects external 5.1 kohm Rd resistors. Do not enable the
 internal Rd at the same time unless the board hardware is changed accordingly.
+
+## License
+
+Original project code, tools, and documentation are provided under the [MIT License](LICENSE).
+WCH-provided code and WCH-derived portions retain their existing copyright notices
+and usage conditions. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for scope
+and third-party terms; the MIT license does not replace those terms.
